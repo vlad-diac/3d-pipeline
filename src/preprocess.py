@@ -9,13 +9,19 @@ Design decisions (from the consolidated plan):
   - Gray composite (127) for the paint model reference:  reduces directional
     lighting bias, giving more balanced texture generation.
   - White composite for the shape-model input:  DiT was trained on white-bg images.
-  - Alpha-extrema check before running rembg:  don't destroy pre-existing masks.
+  - rembg always runs when remove_bg=True:  even images with existing transparency
+    are re-processed to ensure a clean, model-quality alpha mask.  Soft or
+    garbage alpha from JPEG compression / photo-editing apps bleeds background
+    colour into the gray/white composite, which distorts shape generation and
+    bakes lighting artefacts into the final texture.
+  - Optional alpha-edge erosion (erode_alpha):  trims halo bleed left by rembg
+    around high-contrast foreground edges.
   - Lazy BackgroundRemover import:  avoids onnxruntime overhead when not needed.
   - EXIF rotation not applied by default (correct for synthetic renders;
     pass exif_transpose=True for real photographs).
 
-All heavy imports (rembg, numpy) are deferred to function bodies so that the
-module is importable on macOS without GPU dependencies.
+All heavy imports (rembg, numpy, cv2) are deferred to function bodies so that
+the module is importable on macOS without GPU dependencies.
 """
 
 from __future__ import annotations
@@ -115,11 +121,14 @@ def maybe_remove_background(
     background_remover=None,
 ) -> Image.Image:
     """
-    Run background removal only when necessary.
+    Run background removal unconditionally (when enabled).
 
-    Background removal is **skipped** if the image already has a non-trivial
-    alpha channel (alpha_min < 255).  This prevents destroying pre-existing masks
-    from rendering pipelines or manual editing.
+    rembg runs on every input regardless of whether the image already has an
+    alpha channel.  Trusting a pre-existing alpha is risky because soft edges
+    from JPEG compression, photo-editing apps, or low-quality renders bleed
+    background colour into the gray/white composite, which propagates as
+    silhouette distortion in shape generation and lighting artefacts in the
+    final texture.
 
     Args:
         image:               Input image (any mode; converted to RGBA internally).
@@ -128,7 +137,7 @@ def maybe_remove_background(
                              If None and removal is needed, one is created lazily.
 
     Returns:
-        RGBA image with background removed (or original RGBA if skipped).
+        RGBA image with background removed (or original RGBA if remove_bg=False).
     """
     image = image.convert("RGBA")
 
@@ -137,23 +146,49 @@ def maybe_remove_background(
 
     alpha = image.getchannel("A")
     alpha_min, alpha_max = alpha.getextrema()
+    logger.debug(
+        "Running background removal (alpha_min=%d, alpha_max=%d).",
+        alpha_min,
+        alpha_max,
+    )
 
-    if alpha_min == alpha_max == 255:
-        # Fully opaque — safe to run removal.
-        if background_remover is None:
-            from hy3dshape.rembg import BackgroundRemover  # type: ignore[import]
-            background_remover = BackgroundRemover()
-        logger.debug("Running background removal (fully opaque input).")
-        image = background_remover(image)
-    else:
-        logger.debug(
-            "Skipping background removal — image already has transparency "
-            "(alpha_min=%d, alpha_max=%d).",
-            alpha_min,
-            alpha_max,
-        )
+    if background_remover is None:
+        from hy3dshape.rembg import BackgroundRemover  # type: ignore[import]
+        background_remover = BackgroundRemover()
 
+    image = background_remover(image)
     return image
+
+
+def erode_alpha(image: Image.Image, px: int) -> Image.Image:
+    """
+    Erode the alpha mask by ``px`` pixels to remove background halo bleed.
+
+    rembg occasionally leaves a 1–3 px fringe of semi-transparent background
+    pixels around the foreground silhouette.  A small erosion clips that fringe
+    before compositing, preventing background colour from bleeding into the
+    gray/white reference images seen by the shape and paint models.
+
+    Args:
+        image: RGBA input image.
+        px:    Erosion radius in pixels.  0 disables the step (no-op).
+               Values of 1–2 are recommended for real photographs; 0 for clean
+               CG renders where rembg produces sharp edges already.
+
+    Returns:
+        RGBA image with the alpha mask eroded by ``px`` pixels.
+    """
+    if px <= 0:
+        return image
+
+    import cv2  # type: ignore[import]
+    import numpy as np
+
+    image = image.convert("RGBA")
+    arr = np.array(image)
+    kernel = np.ones((px * 2 + 1, px * 2 + 1), np.uint8)
+    arr[..., 3] = cv2.erode(arr[..., 3], kernel, iterations=1)
+    return Image.fromarray(arr)
 
 
 def compose_over_gray(image: Image.Image, gray: int = 127) -> Image.Image:
@@ -204,6 +239,7 @@ def preprocess_view(
     *,
     remove_bg: bool = True,
     background_remover=None,
+    erode_px: int = 0,
     for_shape: bool = False,
     gray: int = 127,
 ) -> Image.Image:
@@ -211,13 +247,15 @@ def preprocess_view(
     Run the full preprocessing chain for one view image.
 
     Steps:
-        1. Maybe remove background (rembg).
-        2. Composite over gray (paint reference) or white (shape input).
+        1. Remove background (rembg) — always runs when remove_bg=True.
+        2. Optionally erode alpha mask to trim halo bleed.
+        3. Composite over gray (paint reference) or white (shape input).
 
     Args:
         image:               Input image.
         remove_bg:           Whether to run background removal.
         background_remover:  Pre-loaded remover instance (reuse across views).
+        erode_px:            Pixels to erode from the alpha mask edge (0 = off).
         for_shape:           If True, composite over white (shape conditioning).
                              If False, composite over gray (paint reference).
         gray:                Gray level for paint composite.
@@ -226,6 +264,7 @@ def preprocess_view(
         RGB image ready for model input.
     """
     rgba = maybe_remove_background(image, remove_bg=remove_bg, background_remover=background_remover)
+    rgba = erode_alpha(rgba, px=erode_px)
     if for_shape:
         return compose_over_white(rgba)
     return compose_over_gray(rgba, gray=gray)
@@ -235,6 +274,7 @@ def preprocess_all_views(
     views: dict[str, Image.Image],
     *,
     remove_bg: bool = True,
+    erode_px: int = 0,
 ) -> dict[str, dict[str, Image.Image]]:
     """
     Preprocess all collected view images and return both variants.
@@ -245,6 +285,7 @@ def preprocess_all_views(
     Args:
         views:      Dict of view name → RGBA PIL image (from collect_views).
         remove_bg:  Whether to run background removal.
+        erode_px:   Pixels to erode from the alpha mask edge after rembg (0 = off).
 
     Returns:
         Dict mapping each view name to a sub-dict:
@@ -272,6 +313,7 @@ def preprocess_all_views(
 
     for name, img in views.items():
         rgba = maybe_remove_background(img, remove_bg=remove_bg, background_remover=background_remover)
+        rgba = erode_alpha(rgba, px=erode_px)
         result[name] = {
             "rgba": rgba,
             "shape": compose_over_white(rgba),

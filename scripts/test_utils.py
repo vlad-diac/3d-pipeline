@@ -73,6 +73,29 @@ def _reset_vram_peak() -> None:
 # RunLogger
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Seed helper
+# ---------------------------------------------------------------------------
+
+def resolve_seed(seed: int | None) -> int:
+    """
+    Return a seed to use for this run.
+
+    If ``seed`` is None, a random 32-bit seed is generated so the run is
+    still fully reproducible (the actual value is recorded in metrics).
+
+    Args:
+        seed: Value from --seed CLI arg, or None if the flag was omitted.
+
+    Returns:
+        The seed that should be used for this run.
+    """
+    import random
+    if seed is None:
+        seed = random.randint(0, 2 ** 32 - 1)
+    return seed
+
+
 class RunLogger:
     """
     Records timing and metrics for a single test run.

@@ -50,7 +50,7 @@ import trimesh
 
 
 from datetime import datetime
-from scripts.test_utils import RunLogger
+from scripts.test_utils import RunLogger, resolve_seed
 
 OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase3" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -303,11 +303,16 @@ def main() -> None:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
+        help="Random seed. Omit to generate a random seed (logged for reproducibility).",
     )
     args = parser.parse_args()
 
+    seed = resolve_seed(args.seed)
+    log.metric("seed", seed, note="pass --seed to reproduce")
+
     print(f"Output directory: {OUTPUT_DIR.relative_to(_PROJECT_ROOT)}")
+    print(f"Seed: {seed}{' (random)' if args.seed is None else ' (fixed)'}")
 
     failed = False
 
@@ -343,7 +348,7 @@ def main() -> None:
             from src.config import PipelineConfig
             cfg = PipelineConfig.for_runpod()
             cfg.shape_steps = args.shape_steps
-            cfg.seed = args.seed
+            cfg.seed = seed
             test_gpu_generate(args.image, cfg)
         except Exception as exc:
             import traceback

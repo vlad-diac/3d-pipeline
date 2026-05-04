@@ -8,8 +8,9 @@ What it tests:
   4. load_image_rgba() loads a real file or a synthetic RGBA image.
   5. collect_views() builds a single-view dict.
   6. compose_over_gray() and compose_over_white() produce correct RGB images.
-  7. maybe_remove_background() skips removal when alpha channel is already present.
-  8. preprocess_all_views() returns shape + paint + rgba variants for every view.
+  7. maybe_remove_background() always calls rembg regardless of existing alpha.
+  8. erode_alpha() shrinks the alpha mask (or is a no-op at px=0).
+  9. preprocess_all_views() returns shape + paint + rgba variants for every view.
 
 Outputs written to  outputs/test/phase2/ :
   front_rgba.png         — RGBA after simulated background removal (alpha kept)
@@ -39,7 +40,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from PIL import Image, ImageDraw
 import numpy as np
 from datetime import datetime
-from scripts.test_utils import RunLogger
+from scripts.test_utils import RunLogger, resolve_seed
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ def test_load_and_compose(input_path: Path | None) -> None:
         collect_views,
         compose_over_gray,
         compose_over_white,
+        erode_alpha,
         maybe_remove_background,
         preprocess_all_views,
     )
@@ -158,18 +160,60 @@ def test_load_and_compose(input_path: Path | None) -> None:
             f"Corner pixel should be white=255, got {arr_w[0, 0]}"
         save(white_rgb, "synthetic_shape.png")
 
-    with log.step("maybe_remove_background (existing alpha)", tier="CPU"):
-        result = maybe_remove_background(synth.copy(), remove_bg=True, background_remover=None)
-        assert result.mode == "RGBA"
+    with log.step("maybe_remove_background (remove_bg=False)", tier="CPU"):
+        # Master switch off — rembg must never be called and the image is
+        # returned as-is (no import of BackgroundRemover needed).
+        result_off = maybe_remove_background(synth.copy(), remove_bg=False)
+        assert result_off.mode == "RGBA"
+
+    with log.step("maybe_remove_background (stub, transparent input)", tier="CPU"):
+        # rembg must fire on ANY input — even images that already have
+        # transparency.  Pass a no-op stub so this runs without hy3dshape.
+        stub_fired: list[bool] = []
+        def _stub(img: Image.Image) -> Image.Image:  # noqa: E306
+            stub_fired.append(True)
+            return img.convert("RGBA")
+        maybe_remove_background(synth.copy(), remove_bg=True, background_remover=_stub)
+        assert stub_fired, "background_remover was not called on a transparent input"
+
+    with log.step("maybe_remove_background (stub, opaque input)", tier="CPU"):
+        # rembg must also fire on fully opaque inputs (existing behaviour).
+        stub_fired2: list[bool] = []
+        def _stub2(img: Image.Image) -> Image.Image:  # noqa: E306
+            stub_fired2.append(True)
+            return img.convert("RGBA")
+        opaque = Image.new("RGBA", (64, 64), (200, 100, 50, 255))
+        maybe_remove_background(opaque, remove_bg=True, background_remover=_stub2)
+        assert stub_fired2, "background_remover was not called on an opaque input"
 
     try:
         from hy3dshape.rembg import BackgroundRemover  # type: ignore[import]
-        opaque = Image.new("RGBA", (64, 64), (200, 100, 50, 255))
-        with log.step("maybe_remove_background (opaque → rembg)", tier="CPU"):
-            result_opaque = maybe_remove_background(opaque, remove_bg=True)
+        remover = BackgroundRemover()
+        opaque2 = Image.new("RGBA", (64, 64), (200, 100, 50, 255))
+        with log.step("maybe_remove_background (real rembg, opaque)", tier="CPU"):
+            result_opaque = maybe_remove_background(opaque2, remove_bg=True, background_remover=remover)
             assert result_opaque.mode == "RGBA"
+        with log.step("maybe_remove_background (real rembg, transparent)", tier="CPU"):
+            result_transp = maybe_remove_background(synth.copy(), remove_bg=True, background_remover=remover)
+            assert result_transp.mode == "RGBA"
     except ImportError:
-        print("      maybe_remove_background (opaque → rembg): SKIPPED (hy3dshape not installed)")
+        print("      maybe_remove_background (real rembg): SKIPPED (hy3dshape not installed)")
+
+    with log.step("erode_alpha (px=0 no-op)", tier="CPU"):
+        eroded_noop = erode_alpha(synth.copy(), px=0)
+        assert np.array_equal(np.array(eroded_noop), np.array(synth)), \
+            "erode_alpha(px=0) must return the image unchanged"
+
+    with log.step("erode_alpha (px=4 shrinks mask)", tier="CPU"):
+        eroded = erode_alpha(synth.copy(), px=4)
+        assert eroded.mode == "RGBA"
+        orig_coverage = int(np.count_nonzero(np.array(synth)[..., 3]))
+        ero_coverage = int(np.count_nonzero(np.array(eroded)[..., 3]))
+        assert ero_coverage < orig_coverage, (
+            f"Erosion should reduce alpha coverage ({ero_coverage} >= {orig_coverage})"
+        )
+        log.metric("alpha_coverage_before", orig_coverage, unit="px")
+        log.metric("alpha_coverage_after", ero_coverage, unit="px")
 
     if input_path is not None:
         with log.step(f"load_image_rgba({input_path.name})", tier="CPU"):
@@ -218,9 +262,19 @@ def main() -> None:
         default=None,
         help="Optional input image path. If omitted, a synthetic image is used.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed. Omit to generate a random seed (logged for reproducibility).",
+    )
     args = parser.parse_args()
 
+    seed = resolve_seed(args.seed)
+    log.metric("seed", seed, note="pass --seed to reproduce")
+
     print(f"Output directory: {OUTPUT_DIR.relative_to(_PROJECT_ROOT)}")
+    print(f"Seed: {seed}{' (random)' if args.seed is None else ' (fixed)'}")
 
     failed = False
     try:

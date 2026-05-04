@@ -115,6 +115,13 @@ class PipelineConfig:
     # "NS" = Navier-Stokes, "TELEA" = Fast Marching
     inpaint_method: str = "NS"
 
+    # ---------------------------------------------------- background removal
+    # Pixels to erode from the rembg alpha mask edge after background removal.
+    # Clips halo bleed where rembg leaves a semi-transparent fringe around the
+    # foreground silhouette.  0 = disabled.  Start with 1–2 for real photographs;
+    # leave at 0 for clean CG renders where rembg already gives sharp edges.
+    rembg_erode_px: int = 0
+
     # ---------------------------------------------------------- reproducibility
     seed: int = 42
 
