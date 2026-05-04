@@ -44,7 +44,8 @@ import numpy as np
 # Output directory
 # ---------------------------------------------------------------------------
 
-OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase2"
+from datetime import datetime
+OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase2" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

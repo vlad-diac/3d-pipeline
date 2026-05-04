@@ -49,7 +49,8 @@ import numpy as np
 import trimesh
 
 
-OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase3"
+from datetime import datetime
+OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase3" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
