@@ -13,7 +13,7 @@ todos:
     status: completed
   - id: phase4-render-paint
     content: "Phase 4: Create render_multiview.py and paint_multiview.py"
-    status: pending
+    status: completed
   - id: phase5-bake-export-cli
     content: "Phase 5: Create bake_texture.py, inpaint_texture.py, export_glb.py, and main.py CLI"
     status: pending
