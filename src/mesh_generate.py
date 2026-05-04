@@ -32,6 +32,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Imported lazily at call-time to avoid circular imports at module level;
+# referenced here so the dependency is obvious.
+# from src.preprocess import VIEW_ORDER
+
 
 # ---------------------------------------------------------------------------
 # Step C: Load shape pipeline
@@ -171,11 +175,17 @@ def generate_mesh(pipeline, views: dict, cfg):
         image_input = list(views.values())[0]
         logger.info("Generating mesh from single view (seed=%d, steps=%d).", seed, cfg.shape_steps)
     else:
-        # Four-view dict: the pipeline expects the full dict keyed by view name.
-        image_input = views
+        # The 2mv pipeline expects an ordered list [front, left, right, back],
+        # not a keyed dict. Import VIEW_ORDER here to avoid a circular import
+        # at module level (preprocess imports nothing from mesh_generate).
+        from src.preprocess import VIEW_ORDER  # type: ignore[import]
+        image_input = [views[k] for k in VIEW_ORDER if k in views]
         logger.info(
-            "Generating mesh from %d views (seed=%d, steps=%d).",
-            len(views), seed, cfg.shape_steps,
+            "Generating mesh from %d views %s (seed=%d, steps=%d).",
+            len(image_input),
+            [k for k in VIEW_ORDER if k in views],
+            seed,
+            cfg.shape_steps,
         )
 
     with torch.inference_mode():

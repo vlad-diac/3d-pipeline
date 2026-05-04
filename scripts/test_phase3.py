@@ -244,32 +244,72 @@ def test_nan_removal() -> None:
 # GPU-tier tests
 # ---------------------------------------------------------------------------
 
-def test_gpu_generate(image_path: Path, cfg) -> None:
+def test_gpu_generate(
+    image_path: Path | None,
+    multiview_dir: Path | None,
+    cfg,
+) -> None:
+    """
+    GPU-tier generation test.
+
+    Exactly one of image_path or multiview_dir must be provided.
+      image_path:    single front view → Path A (v2.1 single-image DiT)
+      multiview_dir: folder with *-front/left/right/back.* → Path B (2mv DiT)
+    """
     import torch
     from src.mesh_generate import load_shape_pipeline_auto, generate_mesh
     from src.mesh_postprocess import postprocess_mesh, save_mesh
-    from src.preprocess import load_image_rgba, compose_over_white
+    from src.preprocess import (
+        scan_multiview_folder,
+        collect_views,
+        preprocess_all_views,
+        compose_over_white,
+        load_image_rgba,
+    )
 
     print(f"\n[GPU] shape_steps={cfg.shape_steps}  guidance={cfg.shape_guidance_scale}  seed={cfg.seed}")
 
-    with log.step("load_image + white composite", tier="GPU"):
-        raw_img = load_image_rgba(image_path)
-        shape_img = compose_over_white(raw_img)
-        log.metric("input_image", f"{image_path.name} {raw_img.size[0]}×{raw_img.size[1]}", unit="px")
+    # ---- Build the views dict (RGBA PIL images) ----------------------------
+    if multiview_dir is not None:
+        with log.step("scan_multiview_folder", tier="GPU"):
+            view_paths = scan_multiview_folder(multiview_dir)
+            for orient, p in view_paths.items():
+                log.metric(f"input_{orient}", p.name)
 
+        with log.step("load + preprocess all views", tier="GPU"):
+            raw_views = collect_views(**{k: str(v) for k, v in view_paths.items()})
+            processed = preprocess_all_views(raw_views, remove_bg=False)
+            shape_views = {k: v["shape"] for k, v in processed.items()}
+            for orient, img in shape_views.items():
+                log.metric(f"view_{orient}_size", f"{img.size[0]}×{img.size[1]}", unit="px")
+
+        cfg.use_multiview_shape = True
+        mode_label = f"multiview ({len(shape_views)} views)"
+
+    else:
+        with log.step("load_image + white composite", tier="GPU"):
+            raw_img = load_image_rgba(image_path)
+            shape_views = {"front": compose_over_white(raw_img)}
+            log.metric("input_image", f"{image_path.name} {raw_img.size[0]}×{raw_img.size[1]}", unit="px")
+
+        cfg.use_multiview_shape = False
+        mode_label = "single-image"
+
+    log.metric("generation_mode", mode_label)
+
+    # ---- Load pipeline + generate -----------------------------------------
     with log.step("load_shape_pipeline_auto", tier="GPU"):
         pipeline = load_shape_pipeline_auto(cfg)
 
-    views = {"front": shape_img}
-
-    with log.step(f"generate_mesh (steps={cfg.shape_steps})", tier="GPU"):
-        raw_mesh = generate_mesh(pipeline, views, cfg)
+    with log.step(f"generate_mesh ({mode_label}, steps={cfg.shape_steps})", tier="GPU"):
+        raw_mesh = generate_mesh(pipeline, shape_views, cfg)
         log.metric("raw_vertices", len(raw_mesh.vertices), unit="verts")
         log.metric("raw_faces",    len(raw_mesh.faces),    unit="faces")
 
     save_mesh(raw_mesh, OUTPUT_DIR / "mesh_raw.glb")
     print(f"      saved → outputs/test/phase3/mesh_raw.glb")
 
+    # ---- Postprocess -------------------------------------------------------
     with log.step(f"postprocess_mesh (target={cfg.target_faces})", tier="GPU"):
         post_mesh = postprocess_mesh(raw_mesh, target_faces=cfg.target_faces, normalize=cfg.normalize_mesh)
         log.metric("post_vertices", len(post_mesh.vertices), unit="verts")
@@ -287,12 +327,38 @@ def test_gpu_generate(image_path: Path, cfg) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 3 test: mesh_generate + mesh_postprocess")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Phase 3 test: mesh_generate + mesh_postprocess",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+GPU tier examples:
+  # Path A — single image (v2.1 DiT)
+  python scripts/test_phase3.py --image inputs/object.png
+
+  # Path B — four-view folder (2mv DiT)
+  #   folder must contain files ending -front/left/right/back.<ext>
+  python scripts/test_phase3.py --multiview inputs/object/
+        """,
+    )
+
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         "--image",
         type=Path,
         default=None,
-        help="Input image for GPU generation test. Required for GPU tier.",
+        metavar="PATH",
+        help="Single front-view image → Path A (v2.1 single-image DiT).",
+    )
+    input_group.add_argument(
+        "--multiview",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Folder containing 4 orientation-suffixed images → Path B (2mv DiT).\n"
+            "Expected filenames: *-front.<ext>  *-left.<ext>  *-right.<ext>  *-back.<ext>\n"
+            "Supported extensions: png jpg jpeg webp tiff tif bmp"
+        ),
     )
     parser.add_argument(
         "--shape-steps",
@@ -339,17 +405,26 @@ def main() -> None:
     except ImportError:
         cuda_available = False
 
+    gpu_input_provided = args.image is not None or args.multiview is not None
+
     if not cuda_available:
         print("\n[GPU tier] SKIPPED — CUDA not available (expected on macOS / CPU-only env).")
-    elif args.image is None:
-        print("\n[GPU tier] SKIPPED — pass --image <path> to run generation test.")
+    elif not gpu_input_provided:
+        print(
+            "\n[GPU tier] SKIPPED — provide --image <path> (single-view) "
+            "or --multiview <dir> (four-view) to run generation test."
+        )
     else:
         try:
             from src.config import PipelineConfig
             cfg = PipelineConfig.for_runpod()
             cfg.shape_steps = args.shape_steps
             cfg.seed = seed
-            test_gpu_generate(args.image, cfg)
+            test_gpu_generate(
+                image_path=args.image,
+                multiview_dir=args.multiview,
+                cfg=cfg,
+            )
         except Exception as exc:
             import traceback
             print(f"\n[GPU tier] FAIL: {exc}", file=sys.stderr)

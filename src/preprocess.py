@@ -34,6 +34,81 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# Canonical view order shared with mesh_generate.py.
+# The 2mv pipeline expects images in exactly this sequence.
+VIEW_ORDER: list[str] = ["front", "left", "right", "back"]
+
+# Image file extensions recognised when scanning a multiview folder.
+IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Multiview folder scanning
+# ---------------------------------------------------------------------------
+
+def scan_multiview_folder(folder: Path | str) -> dict[str, Path]:
+    """
+    Scan a folder for orientation-suffixed images and return a path dict.
+
+    Filename convention:  <any-prefix>-<orientation>.<ext>
+    Recognised orientations: front, left, right, back  (case-insensitive stem match)
+    Recognised extensions:   IMAGE_EXTENSIONS
+
+    Example layout:
+        inputs/object/
+            object-front.png
+            object-left.png
+            object-right.png
+            object-back.png
+
+    Args:
+        folder: Directory to scan.
+
+    Returns:
+        Dict mapping orientation name → Path, e.g.
+        {"front": Path("object-front.png"), "left": ..., ...}
+
+    Raises:
+        NotADirectoryError: If ``folder`` does not exist or is not a directory.
+        ValueError: If one or more orientations are missing.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Multiview folder not found or not a directory: {folder}")
+
+    found: dict[str, Path] = {}
+    for path in sorted(folder.iterdir()):
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        stem = path.stem.lower()
+        for orient in VIEW_ORDER:
+            if stem.endswith(f"-{orient}"):
+                if orient not in found:
+                    found[orient] = path
+                else:
+                    logger.warning(
+                        "Duplicate '%s' view found — keeping %s, ignoring %s.",
+                        orient, found[orient].name, path.name,
+                    )
+
+    missing = [o for o in VIEW_ORDER if o not in found]
+    if missing:
+        raise ValueError(
+            f"Multiview folder is missing views {missing}.\n"
+            f"  Folder: {folder}\n"
+            f"  Found:  {list(found.keys())}\n"
+            f"  Expected filenames ending in: "
+            + ", ".join(f"-{o}.<ext>" for o in missing)
+        )
+
+    logger.info(
+        "Multiview folder scanned: %s",
+        {o: found[o].name for o in VIEW_ORDER},
+    )
+    return {o: found[o] for o in VIEW_ORDER}
+
 
 # ---------------------------------------------------------------------------
 # Step A: loading and validation
