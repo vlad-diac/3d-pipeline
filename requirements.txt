@@ -1,0 +1,43 @@
+# Hunyuan3D Multiview Pipeline — Python dependencies
+# Pinned from docs/plans/hunyuan3d_multiview_pipeline_plan.md Section 3
+#
+# PyTorch is installed separately in setup.sh (different index URLs per platform):
+#   Linux (CUDA 12.4): torch==2.5.1+cu124  torchvision==0.20.1+cu124  torchaudio==2.5.1+cu124
+#   macOS (CPU):       torch==2.5.1         torchvision==0.20.1         torchaudio==2.5.1
+#
+# GPU-only packages (install manually on RunPod after setup.sh completes):
+#   cupy-cuda12x==13.3.0
+#   xformers==0.0.28.post3
+
+# ── ML / Diffusion ─────────────────────────────────────────────────────────────
+diffusers==0.31.0
+transformers==4.46.0
+accelerate==1.1.1
+safetensors==0.4.5
+huggingface-hub==0.30.2
+pytorch-lightning==2.4.0
+timm==1.0.11
+einops==0.8.0
+
+# ── Image processing ───────────────────────────────────────────────────────────
+opencv-python==4.10.0.84
+Pillow==10.4.0
+scikit-image==0.24.0
+rembg==2.0.65
+onnxruntime==1.19.2
+basicsr==1.4.2
+realesrgan==0.3.0
+
+# ── 3D mesh processing ─────────────────────────────────────────────────────────
+trimesh==4.4.9
+xatlas==0.0.10
+pymeshlab==2023.12.post2
+pygltflib==1.16.3
+open3d==0.18.0
+
+# ── Configuration / build ──────────────────────────────────────────────────────
+omegaconf==2.3.0
+pyyaml==6.0.2
+configargparse==1.7
+pybind11==2.13.6
+ninja==1.11.1.1

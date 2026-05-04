@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.pyd
+
+# Conda / virtualenv
+conda/
+.venv/
+venv/
+
+# Model weights and large binary assets
+models/
+!models/.gitkeep
+
+# Downloaded third-party repos (cloned by setup.sh)
+third_party/
+!third_party/.gitkeep
+
+# Pipeline outputs
+outputs/
+!outputs/.gitkeep
+
+# Test/scratch inputs (keep .gitkeep placeholder)
+inputs/
+!inputs/.gitkeep
+
+# macOS
+.DS_Store
