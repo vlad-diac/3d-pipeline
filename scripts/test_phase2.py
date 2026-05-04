@@ -38,21 +38,23 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from PIL import Image, ImageDraw
 import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Output directory
-# ---------------------------------------------------------------------------
-
 from datetime import datetime
+from scripts.test_utils import RunLogger
+
+
+# ---------------------------------------------------------------------------
+# Output directory + logger
+# ---------------------------------------------------------------------------
+
 OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase2" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+log = RunLogger(OUTPUT_DIR, phase="Phase 2")
 
 
 def save(img: Image.Image, name: str) -> None:
     path = OUTPUT_DIR / name
     img.save(path)
-    print(f"  saved → {path.relative_to(_PROJECT_ROOT)}")
+    print(f"      saved → {path.relative_to(_PROJECT_ROOT)}")
 
 
 # ---------------------------------------------------------------------------
@@ -89,39 +91,39 @@ def test_config() -> None:
     print("\n[1] Config dataclasses")
     from src.config import CameraConfig, PipelineConfig
 
-    cam = CameraConfig()
-    assert len(cam.azimuths) == len(cam.elevations) == len(cam.weights) == 6
-    assert cam.ortho_scale == 1.0
-    print("  CameraConfig default: OK")
+    with log.step("CameraConfig default", tier="CPU"):
+        cam = CameraConfig()
+        assert len(cam.azimuths) == len(cam.elevations) == len(cam.weights) == 6
+        assert cam.ortho_scale == 1.0
 
-    cfg_dev = PipelineConfig.for_macos_dev()
-    assert cfg_dev.device == "cpu"
-    assert cfg_dev.models_dir == _PROJECT_ROOT / "models"
-    assert cfg_dev.third_party_dir == _PROJECT_ROOT / "third_party"
-    assert cfg_dev.delight_model_dir == _PROJECT_ROOT / "models" / "delight"
-    print("  PipelineConfig.for_macos_dev(): OK")
+    with log.step("PipelineConfig.for_macos_dev()", tier="CPU"):
+        cfg_dev = PipelineConfig.for_macos_dev()
+        assert cfg_dev.device == "cpu"
+        assert cfg_dev.models_dir == _PROJECT_ROOT / "models"
+        assert cfg_dev.third_party_dir == _PROJECT_ROOT / "third_party"
+        assert cfg_dev.delight_model_dir == _PROJECT_ROOT / "models" / "delight"
 
-    cfg_pod = PipelineConfig.for_runpod(texture_size=2048)
-    assert cfg_pod.device == "cuda"
-    assert cfg_pod.texture_size == 2048
-    assert cfg_pod.render_size >= cfg_pod.texture_size
-    print("  PipelineConfig.for_runpod(texture_size=2048): OK")
+    with log.step("PipelineConfig.for_runpod(texture_size=2048)", tier="CPU"):
+        cfg_pod = PipelineConfig.for_runpod(texture_size=2048)
+        assert cfg_pod.device == "cuda"
+        assert cfg_pod.texture_size == 2048
+        assert cfg_pod.render_size >= cfg_pod.texture_size
 
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        _ = PipelineConfig(render_size=512, texture_size=4096)
-        assert len(w) == 1
-        assert issubclass(w[0].category, UserWarning)
-        assert "render_size" in str(w[0].message)
-    print("  render_size < texture_size warning: OK")
+    with log.step("render_size < texture_size warning", tier="CPU"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = PipelineConfig(render_size=512, texture_size=4096)
+            assert len(w) == 1
+            assert issubclass(w[0].category, UserWarning)
+            assert "render_size" in str(w[0].message)
 
-    bad_cam_raised = False
-    try:
-        CameraConfig(azimuths=[0, 90], elevations=[0], weights=[1.0, 0.5])
-    except ValueError:
-        bad_cam_raised = True
-    assert bad_cam_raised, "Expected ValueError for mismatched lengths"
-    print("  CameraConfig length mismatch raises ValueError: OK")
+    with log.step("CameraConfig length mismatch raises ValueError", tier="CPU"):
+        raised = False
+        try:
+            CameraConfig(azimuths=[0, 90], elevations=[0], weights=[1.0, 0.5])
+        except ValueError:
+            raised = True
+        assert raised, "Expected ValueError for mismatched lengths"
 
 
 def test_load_and_compose(input_path: Path | None) -> None:
@@ -135,80 +137,73 @@ def test_load_and_compose(input_path: Path | None) -> None:
         preprocess_all_views,
     )
 
-    # ---- synthetic image (always tested) -----------------------------------
-    synth = make_synthetic_rgba()
-    save(synth, "synthetic_rgba.png")
+    with log.step("make_synthetic_rgba", tier="CPU"):
+        synth = make_synthetic_rgba()
+        save(synth, "synthetic_rgba.png")
+        log.metric("synthetic_size_px", synth.size[0], unit="px")
 
-    gray_rgb = compose_over_gray(synth, gray=127)
-    assert gray_rgb.mode == "RGB", f"Expected RGB, got {gray_rgb.mode}"
-    arr = np.array(gray_rgb)
-    # Corners (transparent in source) should be exactly gray=127.
-    assert arr[0, 0, 0] == 127 and arr[0, 0, 1] == 127 and arr[0, 0, 2] == 127, \
-        f"Corner pixel should be gray=127, got {arr[0, 0]}"
-    save(gray_rgb, "synthetic_paint.png")
-    print("  compose_over_gray: OK")
+    with log.step("compose_over_gray", tier="CPU"):
+        gray_rgb = compose_over_gray(synth, gray=127)
+        assert gray_rgb.mode == "RGB", f"Expected RGB, got {gray_rgb.mode}"
+        arr = np.array(gray_rgb)
+        assert arr[0, 0, 0] == 127 and arr[0, 0, 1] == 127 and arr[0, 0, 2] == 127, \
+            f"Corner pixel should be gray=127, got {arr[0, 0]}"
+        save(gray_rgb, "synthetic_paint.png")
 
-    white_rgb = compose_over_white(synth)
-    assert white_rgb.mode == "RGB"
-    arr_w = np.array(white_rgb)
-    assert arr_w[0, 0, 0] == 255 and arr_w[0, 0, 1] == 255 and arr_w[0, 0, 2] == 255, \
-        f"Corner pixel should be white=255, got {arr_w[0, 0]}"
-    save(white_rgb, "synthetic_shape.png")
-    print("  compose_over_white: OK")
+    with log.step("compose_over_white", tier="CPU"):
+        white_rgb = compose_over_white(synth)
+        assert white_rgb.mode == "RGB"
+        arr_w = np.array(white_rgb)
+        assert arr_w[0, 0, 0] == 255 and arr_w[0, 0, 1] == 255 and arr_w[0, 0, 2] == 255, \
+            f"Corner pixel should be white=255, got {arr_w[0, 0]}"
+        save(white_rgb, "synthetic_shape.png")
 
-    # ---- alpha-check: existing mask skips rembg ----------------------------
-    result = maybe_remove_background(synth.copy(), remove_bg=True, background_remover=None)
-    # synth already has transparency so rembg should be skipped;
-    # the call should not raise even without rembg installed.
-    assert result.mode == "RGBA"
-    print("  maybe_remove_background (existing alpha, skip rembg): OK")
+    with log.step("maybe_remove_background (existing alpha)", tier="CPU"):
+        result = maybe_remove_background(synth.copy(), remove_bg=True, background_remover=None)
+        assert result.mode == "RGBA"
 
-    # ---- fully opaque image triggers rembg path ----------------------------
-    opaque = Image.new("RGBA", (64, 64), (200, 100, 50, 255))
     try:
         from hy3dshape.rembg import BackgroundRemover  # type: ignore[import]
-        result_opaque = maybe_remove_background(opaque, remove_bg=True)
-        assert result_opaque.mode == "RGBA"
-        print("  maybe_remove_background (opaque → rembg): OK")
+        opaque = Image.new("RGBA", (64, 64), (200, 100, 50, 255))
+        with log.step("maybe_remove_background (opaque → rembg)", tier="CPU"):
+            result_opaque = maybe_remove_background(opaque, remove_bg=True)
+            assert result_opaque.mode == "RGBA"
     except ImportError:
-        print("  maybe_remove_background (opaque → rembg): SKIPPED (hy3dshape not installed)")
+        print("      maybe_remove_background (opaque → rembg): SKIPPED (hy3dshape not installed)")
 
-    # ---- real image (optional) --------------------------------------------
     if input_path is not None:
-        real_img = load_image_rgba(input_path)
-        print(f"  load_image_rgba({input_path.name}): OK  size={real_img.size}")
+        with log.step(f"load_image_rgba({input_path.name})", tier="CPU"):
+            real_img = load_image_rgba(input_path)
+            log.metric("input_image_size", f"{real_img.size[0]}×{real_img.size[1]}", unit="px")
 
-        views = collect_views(image=str(input_path))
-        assert "front" in views
-        print("  collect_views (single-image mode): OK")
+        with log.step("collect_views (single-image)", tier="CPU"):
+            views = collect_views(image=str(input_path))
+            assert "front" in views
 
-        processed = preprocess_all_views(views, remove_bg=False)
-        assert "front" in processed
-        for key in ("rgba", "shape", "paint"):
-            assert key in processed["front"], f"Missing key '{key}' in processed['front']"
+        with log.step("preprocess_all_views", tier="CPU"):
+            processed = preprocess_all_views(views, remove_bg=False)
+            assert "front" in processed
+            for key in ("rgba", "shape", "paint"):
+                assert key in processed["front"], f"Missing key '{key}'"
+            save(processed["front"]["rgba"],  "front_rgba.png")
+            save(processed["front"]["shape"], "front_shape.png")
+            save(processed["front"]["paint"], "front_paint.png")
 
-        save(processed["front"]["rgba"], "front_rgba.png")
-        save(processed["front"]["shape"], "front_shape.png")
-        save(processed["front"]["paint"], "front_paint.png")
-        print("  preprocess_all_views: OK  (outputs saved)")
+    with log.step("load_image_rgba missing file → FileNotFoundError", tier="CPU"):
+        raised = False
+        try:
+            load_image_rgba(Path("nonexistent_file_xyz.png"))
+        except FileNotFoundError:
+            raised = True
+        assert raised, "Expected FileNotFoundError"
 
-    # ---- FileNotFoundError ------------------------------------------------
-    raised = False
-    try:
-        load_image_rgba(Path("nonexistent_file_xyz.png"))
-    except FileNotFoundError:
-        raised = True
-    assert raised, "Expected FileNotFoundError"
-    print("  load_image_rgba (missing file → FileNotFoundError): OK")
-
-    # ---- collect_views: no args raises ValueError -------------------------
-    raised = False
-    try:
-        collect_views()
-    except ValueError:
-        raised = True
-    assert raised, "Expected ValueError"
-    print("  collect_views (no args → ValueError): OK")
+    with log.step("collect_views no args → ValueError", tier="CPU"):
+        raised = False
+        try:
+            collect_views()
+        except ValueError:
+            raised = True
+        assert raised, "Expected ValueError"
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +222,20 @@ def main() -> None:
 
     print(f"Output directory: {OUTPUT_DIR.relative_to(_PROJECT_ROOT)}")
 
+    failed = False
     try:
         test_config()
         test_load_and_compose(args.image)
-        print(f"\nAll Phase 2 tests passed.")
-        print(f"Results written to: {OUTPUT_DIR}")
     except AssertionError as exc:
         print(f"\nFAIL: {exc}", file=sys.stderr)
+        failed = True
+
+    log.save()
+
+    if failed:
         sys.exit(1)
+    else:
+        print(f"\nAll Phase 2 tests passed.")
 
 
 if __name__ == "__main__":

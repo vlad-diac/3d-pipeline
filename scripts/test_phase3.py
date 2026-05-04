@@ -50,14 +50,17 @@ import trimesh
 
 
 from datetime import datetime
+from scripts.test_utils import RunLogger
+
 OUTPUT_DIR = _PROJECT_ROOT / "outputs" / "test" / "phase3" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+log = RunLogger(OUTPUT_DIR, phase="Phase 3")
 
 
 def save_glb(mesh: trimesh.Trimesh, name: str) -> None:
     path = OUTPUT_DIR / name
     mesh.export(str(path))
-    print(f"  saved → {path.relative_to(_PROJECT_ROOT)}")
+    print(f"      saved → {path.relative_to(_PROJECT_ROOT)}")
 
 
 # ---------------------------------------------------------------------------
@@ -121,24 +124,21 @@ def make_mesh_with_nans() -> trimesh.Trimesh:
 
 def test_imports() -> None:
     print("\n[1] Module imports (CPU)")
-    from src.mesh_postprocess import (  # noqa: F401
-        keep_largest_component,
-        normalize_mesh,
-        decimate_mesh,
-        postprocess_mesh,
-        save_mesh,
-    )
-    print("  src.mesh_postprocess: OK")
+    with log.step("import src.mesh_postprocess", tier="CPU"):
+        from src.mesh_postprocess import (  # noqa: F401
+            keep_largest_component,
+            normalize_mesh,
+            decimate_mesh,
+            postprocess_mesh,
+            save_mesh,
+        )
 
-    # mesh_generate imports are GPU-lazy; just check module is parseable.
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "mesh_generate", _PROJECT_ROOT / "src" / "mesh_generate.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    # Don't exec — would import torch/hy3dshape. Just confirm it loads the spec.
-    assert spec is not None
-    print("  src.mesh_generate: spec loaded OK (imports deferred to GPU tier)")
+    with log.step("spec-check src.mesh_generate (deferred imports)", tier="CPU"):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mesh_generate", _PROJECT_ROOT / "src" / "mesh_generate.py"
+        )
+        assert spec is not None
 
 
 def test_keep_largest_component() -> None:
@@ -147,14 +147,15 @@ def test_keep_largest_component() -> None:
 
     mesh = make_mesh_with_floaters()
     cube = make_unit_cube()
+    assert len(mesh.faces) > len(cube.faces)
 
-    assert len(mesh.faces) > len(cube.faces), "Floater mesh should have more faces than cube alone"
-
-    cleaned = keep_largest_component(mesh)
-    assert len(cleaned.faces) == len(cube.faces), (
-        f"Expected {len(cube.faces)} faces (cube only), got {len(cleaned.faces)}"
-    )
-    print(f"  faces: {len(mesh.faces)} → {len(cleaned.faces)}  (floaters removed): OK")
+    with log.step("keep_largest_component", tier="CPU"):
+        cleaned = keep_largest_component(mesh)
+        assert len(cleaned.faces) == len(cube.faces), (
+            f"Expected {len(cube.faces)} faces, got {len(cleaned.faces)}"
+        )
+        log.metric("floater_faces_before", len(mesh.faces),   unit="faces")
+        log.metric("floater_faces_after",  len(cleaned.faces), unit="faces")
 
     save_glb(mesh, "synth_floaters.glb")
 
@@ -163,21 +164,17 @@ def test_normalize_mesh() -> None:
     print("\n[3] normalize_mesh")
     from src.mesh_postprocess import normalize_mesh
 
-    # Cube scaled to 5× and offset — after normalization should be ~unit.
     mesh = make_unit_cube()
     mesh.apply_scale(5.0)
     mesh.apply_translation([100.0, -50.0, 20.0])
 
-    normalized = normalize_mesh(mesh)
-    bounds = normalized.bounds
-    center = bounds.mean(axis=0)
-    longest_side = float(np.max(bounds[1] - bounds[0]))
-
-    assert np.allclose(center, [0.0, 0.0, 0.0], atol=1e-5), \
-        f"Center should be at origin, got {center}"
-    assert abs(longest_side - 1.0) < 1e-5, \
-        f"Longest side should be 1.0, got {longest_side}"
-    print(f"  center={np.round(center, 4)}, longest_side={longest_side:.4f}: OK")
+    with log.step("normalize_mesh (5× offset cube → unit)", tier="CPU"):
+        normalized = normalize_mesh(mesh)
+        bounds = normalized.bounds
+        center = bounds.mean(axis=0)
+        longest_side = float(np.max(bounds[1] - bounds[0]))
+        assert np.allclose(center, [0.0, 0.0, 0.0], atol=1e-5), f"Center off: {center}"
+        assert abs(longest_side - 1.0) < 1e-5, f"Scale off: {longest_side}"
 
     save_glb(normalized, "synth_normalized.glb")
 
@@ -190,47 +187,43 @@ def test_decimate() -> None:
     original_faces = len(mesh.faces)
     target = 500
 
-    decimated = decimate_mesh(mesh, target_faces=target)
+    with log.step(f"decimate_mesh {original_faces} → {target}", tier="CPU"):
+        decimated = decimate_mesh(mesh, target_faces=target)
+        assert len(decimated.faces) <= target * 1.05, (
+            f"Expected <= {target * 1.05:.0f} faces, got {len(decimated.faces)}"
+        )
+        log.metric("decimate_faces_before", original_faces,        unit="faces")
+        log.metric("decimate_faces_after",  len(decimated.faces),  unit="faces")
 
-    assert len(decimated.faces) <= target * 1.05, (
-        f"Expected <= {target * 1.05:.0f} faces after decimation, got {len(decimated.faces)}"
-    )
-    print(f"  faces: {original_faces} → {len(decimated.faces)} (target={target}): OK")
-
-    # No-op: already under target.
-    mesh_small = make_unit_cube()
-    result_noop = decimate_mesh(mesh_small, target_faces=100_000)
-    assert len(result_noop.faces) == len(mesh_small.faces), "Should be a no-op"
-    print("  no-op (mesh already under target): OK")
+    with log.step("decimate_mesh no-op (already under target)", tier="CPU"):
+        mesh_small = make_unit_cube()
+        result_noop = decimate_mesh(mesh_small, target_faces=100_000)
+        assert len(result_noop.faces) == len(mesh_small.faces)
 
 
 def test_postprocess_full() -> None:
     print("\n[5] postprocess_mesh (full pipeline)")
     from src.mesh_postprocess import postprocess_mesh
 
-    # Build a dirty mesh: floaters + high face count.
     mesh = make_mesh_with_floaters()
-    sphere = make_sphere(subdivisions=4)   # ~5120 faces
+    sphere = make_sphere(subdivisions=4)
     mesh = trimesh.util.concatenate([mesh, sphere])
-    mesh.apply_translation([200.0, 0.0, 0.0])   # out of unit range — normalization test
-
+    mesh.apply_translation([200.0, 0.0, 0.0])
     original_faces = len(mesh.faces)
     target = 1000
 
-    cleaned = postprocess_mesh(mesh, target_faces=target, normalize=True)
+    with log.step(f"postprocess_mesh {original_faces} faces → {target}", tier="CPU"):
+        cleaned = postprocess_mesh(mesh, target_faces=target, normalize=True)
+        assert len(cleaned.faces) <= target * 1.05, \
+            f"Expected <= {target * 1.05:.0f} faces, got {len(cleaned.faces)}"
+        bounds = cleaned.bounds
+        center = bounds.mean(axis=0)
+        longest = float(np.max(bounds[1] - bounds[0]))
+        assert np.allclose(center, [0.0, 0.0, 0.0], atol=1e-4), f"Center off: {center}"
+        assert abs(longest - 1.0) < 1e-4, f"Scale off: {longest}"
+        log.metric("postprocess_faces_before", original_faces,     unit="faces")
+        log.metric("postprocess_faces_after",  len(cleaned.faces), unit="faces")
 
-    # Face count under target.
-    assert len(cleaned.faces) <= target * 1.05, \
-        f"Expected <= {target * 1.05:.0f} faces, got {len(cleaned.faces)}"
-
-    # Normalized.
-    bounds = cleaned.bounds
-    center = bounds.mean(axis=0)
-    longest = float(np.max(bounds[1] - bounds[0]))
-    assert np.allclose(center, [0.0, 0.0, 0.0], atol=1e-4), f"Center off: {center}"
-    assert abs(longest - 1.0) < 1e-4, f"Scale off: {longest}"
-
-    print(f"  faces: {original_faces} → {len(cleaned.faces)}, normalized: OK")
     save_glb(cleaned, "synth_cleaned.glb")
 
 
@@ -239,14 +232,12 @@ def test_nan_removal() -> None:
     from src.mesh_postprocess import postprocess_mesh
 
     mesh = make_mesh_with_nans()
-    # Should not raise — remove_infinite_values handles NaN/Inf.
     try:
-        cleaned = postprocess_mesh(mesh, target_faces=1000, normalize=True)
-        # After NaN removal the mesh may lose the affected face(s) but should be non-empty.
-        print(f"  cleaned mesh has {len(cleaned.faces)} faces (NaN faces removed): OK")
+        with log.step("postprocess_mesh with NaN vertices", tier="CPU"):
+            cleaned = postprocess_mesh(mesh, target_faces=1000, normalize=True)
+            log.metric("nan_mesh_faces_after", len(cleaned.faces), unit="faces")
     except Exception as exc:
-        print(f"  WARNING: NaN removal raised an exception: {exc}")
-        print("  (trimesh may not fully handle all NaN cases — acceptable if mesh is small)")
+        print(f"      WARNING: NaN removal raised: {exc} (acceptable for tiny meshes)")
 
 
 # ---------------------------------------------------------------------------
@@ -259,31 +250,36 @@ def test_gpu_generate(image_path: Path, cfg) -> None:
     from src.mesh_postprocess import postprocess_mesh, save_mesh
     from src.preprocess import load_image_rgba, compose_over_white
 
-    print("\n[GPU] Loading shape pipeline...")
-    pipeline = load_shape_pipeline_auto(cfg)
-    print("  load_shape_pipeline_auto: OK")
+    print(f"\n[GPU] shape_steps={cfg.shape_steps}  guidance={cfg.shape_guidance_scale}  seed={cfg.seed}")
 
-    # Use white composite for shape conditioning.
-    raw_img = load_image_rgba(image_path)
-    shape_img = compose_over_white(raw_img)
+    with log.step("load_image + white composite", tier="GPU"):
+        raw_img = load_image_rgba(image_path)
+        shape_img = compose_over_white(raw_img)
+        log.metric("input_image", f"{image_path.name} {raw_img.size[0]}×{raw_img.size[1]}", unit="px")
+
+    with log.step("load_shape_pipeline_auto", tier="GPU"):
+        pipeline = load_shape_pipeline_auto(cfg)
 
     views = {"front": shape_img}
-    print(f"  Input: {image_path.name}  size={shape_img.size}")
 
-    print(f"\n[GPU] Generating mesh (steps={cfg.shape_steps}, guidance={cfg.shape_guidance_scale})...")
-    raw_mesh = generate_mesh(pipeline, views, cfg)
-    print(f"  Raw mesh: {len(raw_mesh.vertices)} vertices, {len(raw_mesh.faces)} faces")
+    with log.step(f"generate_mesh (steps={cfg.shape_steps})", tier="GPU"):
+        raw_mesh = generate_mesh(pipeline, views, cfg)
+        log.metric("raw_vertices", len(raw_mesh.vertices), unit="verts")
+        log.metric("raw_faces",    len(raw_mesh.faces),    unit="faces")
+
     save_mesh(raw_mesh, OUTPUT_DIR / "mesh_raw.glb")
-    print(f"  saved → outputs/test/phase3/mesh_raw.glb")
+    print(f"      saved → outputs/test/phase3/mesh_raw.glb")
 
-    print(f"\n[GPU] Postprocessing mesh (target_faces={cfg.target_faces})...")
-    post_mesh = postprocess_mesh(raw_mesh, target_faces=cfg.target_faces, normalize=cfg.normalize_mesh)
-    print(f"  Postprocessed: {len(post_mesh.vertices)} vertices, {len(post_mesh.faces)} faces")
+    with log.step(f"postprocess_mesh (target={cfg.target_faces})", tier="GPU"):
+        post_mesh = postprocess_mesh(raw_mesh, target_faces=cfg.target_faces, normalize=cfg.normalize_mesh)
+        log.metric("post_vertices", len(post_mesh.vertices), unit="verts")
+        log.metric("post_faces",    len(post_mesh.faces),    unit="faces")
+
     save_mesh(post_mesh, OUTPUT_DIR / "mesh_postprocessed.glb")
-    print(f"  saved → outputs/test/phase3/mesh_postprocessed.glb")
+    print(f"      saved → outputs/test/phase3/mesh_postprocessed.glb")
 
-    vram_used = torch.cuda.max_memory_allocated() / 1024 ** 3
-    print(f"\n  Peak VRAM used: {vram_used:.2f} GB")
+    peak_vram = torch.cuda.max_memory_allocated() / 1024 ** 3
+    log.metric("peak_vram_shape_gb", round(peak_vram, 2), unit="GB")
 
 
 # ---------------------------------------------------------------------------
@@ -355,12 +351,13 @@ def main() -> None:
             traceback.print_exc()
             failed = True
 
+    log.save()
+
     if failed:
         print("\nSome tests FAILED.", file=sys.stderr)
         sys.exit(1)
     else:
         print(f"\nAll Phase 3 tests passed.")
-        print(f"Results written to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
