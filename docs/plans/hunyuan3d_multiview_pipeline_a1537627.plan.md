@@ -10,7 +10,7 @@ todos:
     status: completed
   - id: phase3-mesh
     content: "Phase 3: Create mesh_generate.py and mesh_postprocess.py"
-    status: pending
+    status: completed
   - id: phase4-render-paint
     content: "Phase 4: Create render_multiview.py and paint_multiview.py"
     status: pending
