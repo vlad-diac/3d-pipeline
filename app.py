@@ -499,7 +499,9 @@ def _stage_canonical_multiview(
 
     with log.step("generate_canonical_views"):
         canonical_views, controls = generate_canonical_views(
-            front_rgba, cfg.canonical, save_dir=save_dir
+            front_rgba, cfg.canonical,
+            save_dir=save_dir,
+            extra_views=state["rgba_views"],  # pass all labeled views for per-view maps
         )
 
     # Overwrite rgba_views so preprocess composites the canonical RGBA.
@@ -526,19 +528,21 @@ def _stage_canonical_multiview(
         },
     }
 
-    if controls:
-        ctrl_b64s = [_pil_to_b64(controls[k]) for k in ["depth", "canny"] if k in controls]
+    rows: list[dict] = [row_canonical]
+
+    # One sub-row per control type, each showing all 4 per-view maps as columns.
+    for ctrl_name, maps_list in controls.items():
+        ctrl_b64s = [_pil_to_b64(img) for img in maps_list]
         while len(ctrl_b64s) < n_cols:
             ctrl_b64s.append(None)
-        row_controls = {
-            "stage":   "↳ controls",
+        rows.append({
+            "stage":   f"↳ {ctrl_name}",
             "type":    "images",
             "views":   ctrl_b64s,
-            "metrics": {k: "on" for k in controls},
-        }
-        return [row_canonical, row_controls], None
+            "metrics": {},
+        })
 
-    return row_canonical, None
+    return rows if len(rows) > 1 else row_canonical, None
 
 
 def _stage_preprocess(

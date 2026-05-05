@@ -158,6 +158,125 @@ def build_canny_map(clean_rgba: Image.Image, gen_size: int = 768) -> Image.Image
 
 
 # ---------------------------------------------------------------------------
+# Per-view control builders (depth + canny for all labeled reference views)
+# ---------------------------------------------------------------------------
+
+def build_view_depth_maps(
+    rgba_views: "dict[str, Image.Image]",
+    anchor: Image.Image,
+    device: str,
+    gen_size: int = 768,
+) -> "list[Image.Image]":
+    """
+    Build a depth map for each canonical view in ``VIEWS`` order.
+
+    For every view name (front, right, back, left) the corresponding image from
+    ``rgba_views`` is used when present; otherwise ``anchor``'s pre-computed
+    depth map is reused.  This ensures single-anchor inputs (user provides only
+    one photo) degrade gracefully to the current broadcast behaviour.
+
+    The DPT model is loaded **once** and reused across all views to avoid
+    repeated HuggingFace downloads and GPU allocation overhead.
+
+    Args:
+        rgba_views: Dict of labeled clean RGBA images (output of remove_background).
+        anchor:     The front/anchor image (already in ``rgba_views["front"]``
+                    under normal conditions, kept as an explicit fallback).
+        device:     PyTorch device string.
+        gen_size:   Output size matching ``cfg.gen_size``.
+
+    Returns:
+        List of 4 depth maps in ``VIEWS`` order (front, right, back, left).
+    """
+    import numpy as np
+    import torch
+    from transformers import DPTFeatureExtractor, DPTForDepthEstimation
+
+    logger.info("Building per-view depth maps (DPT-hybrid-midas) ...")
+
+    feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-hybrid-midas")
+    depth_model = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(device)
+    depth_model.eval()
+
+    def _estimate(img: Image.Image) -> Image.Image:
+        rgb_img = img.convert("RGB")
+        pixel_values = (
+            feature_extractor(images=rgb_img, return_tensors="pt")
+            .pixel_values.to(device)
+        )
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda", enabled=device.startswith("cuda")
+        ):
+            depth_out = depth_model(pixel_values).predicted_depth
+        depth = torch.nn.functional.interpolate(
+            depth_out.unsqueeze(1),
+            size=(1024, 1024),
+            mode="bicubic",
+            align_corners=False,
+        )
+        d_min = torch.amin(depth, dim=[1, 2, 3], keepdim=True)
+        d_max = torch.amax(depth, dim=[1, 2, 3], keepdim=True)
+        depth = (depth - d_min) / (d_max - d_min + 1e-8)
+        arr = (
+            torch.cat([depth] * 3, dim=1)[0].permute(1, 2, 0).cpu().numpy()
+        )
+        result = Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8))
+        return result.resize((gen_size, gen_size), Image.Resampling.LANCZOS)
+
+    # Build anchor map first so missing views can reuse it cheaply.
+    anchor_depth = _estimate(anchor)
+    maps: list[Image.Image] = []
+    for name, _ in VIEWS:
+        img = rgba_views.get(name)
+        maps.append(_estimate(img) if img is not None and img is not anchor else anchor_depth)
+
+    del depth_model
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return maps
+
+
+def build_view_canny_maps(
+    rgba_views: "dict[str, Image.Image]",
+    anchor: Image.Image,
+    gen_size: int = 768,
+) -> "list[Image.Image]":
+    """
+    Build a canny edge map for each canonical view in ``VIEWS`` order.
+
+    Uses the same weak threshold pair as ``build_canny_map``.  Falls back to
+    the anchor's canny for any missing view.
+
+    Args:
+        rgba_views: Dict of labeled clean RGBA images.
+        anchor:     Front/anchor image used as a fallback.
+        gen_size:   Output size matching ``cfg.gen_size``.
+
+    Returns:
+        List of 4 canny maps in ``VIEWS`` order (front, right, back, left).
+    """
+    import cv2
+    import numpy as np
+
+    def _canny(img: Image.Image) -> Image.Image:
+        rgb = np.array(img.convert("RGB"))
+        edges = cv2.Canny(rgb, 100, 200)
+        edges_rgb = np.stack([edges, edges, edges], axis=-1)
+        result = Image.fromarray(edges_rgb)
+        return result.resize((gen_size, gen_size), Image.Resampling.LANCZOS)
+
+    anchor_canny = _canny(anchor)
+    maps: list[Image.Image] = []
+    for name, _ in VIEWS:
+        img = rgba_views.get(name)
+        maps.append(_canny(img) if img is not None and img is not anchor else anchor_canny)
+    return maps
+
+
+# ---------------------------------------------------------------------------
 # Plücker camera controls (MV-Adapter camera conditioning)
 # ---------------------------------------------------------------------------
 
@@ -329,7 +448,8 @@ def generate_canonical_views(
     clean_rgba: Image.Image,
     cfg: "CanonicalMultiviewConfig",
     save_dir: Optional[Path] = None,
-) -> tuple[dict[str, Image.Image], dict[str, Image.Image]]:
+    extra_views: Optional["dict[str, Image.Image]"] = None,
+) -> "tuple[dict[str, Image.Image], dict[str, list[Image.Image]]]":
     """
     Generate canonical ``front/right/back/left`` views from a single clean RGBA.
 
@@ -337,17 +457,28 @@ def generate_canonical_views(
     ``remove_background`` pipeline stage).  This function does **no** background
     removal of its own.
 
+    When ``extra_views`` is provided, depth/canny maps are built **per canonical
+    view** instead of only for the anchor, giving each generated view its own
+    structural conditioning signal.  Views absent from ``extra_views`` fall back
+    to the anchor's map, so single-image inputs degrade gracefully.
+
     Args:
-        clean_rgba: Clean RGBA anchor image (no background).
-        cfg:        ``CanonicalMultiviewConfig`` with all generation settings.
-        save_dir:   Optional directory to save intermediate and output images.
+        clean_rgba:  Clean RGBA anchor image (no background), used as the
+                     ``reference_image`` fed to MV-Adapter.
+        cfg:         ``CanonicalMultiviewConfig`` with all generation settings.
+        save_dir:    Optional directory to save intermediate and output images.
+        extra_views: Optional dict of *all* labeled clean RGBA views
+                     (``{"front": …, "right": …, …}``).  When given and
+                     ``cfg.use_depth`` / ``cfg.use_canny`` is True, per-view
+                     maps are built using ``build_view_depth_maps`` /
+                     ``build_view_canny_maps``.
 
     Returns:
         A 2-tuple ``(canonical, controls)`` where:
         - ``canonical`` is ``{"front": PIL.Image, "right": PIL.Image,
           "back": PIL.Image, "left": PIL.Image}`` — opaque RGBA outputs.
-        - ``controls`` is a dict of the structural conditioning images that
-          were actually built, keyed by ``"depth"`` and/or ``"canny"``.
+        - ``controls`` is a dict keyed by ``"depth"`` and/or ``"canny"``,
+          each mapping to a **list** of 4 PIL images in ``VIEWS`` order.
           Empty when both ``cfg.use_depth`` and ``cfg.use_canny`` are False.
 
     Raises:
@@ -368,16 +499,33 @@ def generate_canonical_views(
     # Prepare anchor image composited over gray (MV-Adapter convention)
     anchor_rgb = _anchor_rgb(clean_rgba, gen_size)
 
-    # Build structural control images
-    depth_img: Optional[Image.Image] = None
-    canny_img: Optional[Image.Image] = None
+    # Build structural control images — per-view when extra_views are available,
+    # single-anchor otherwise.  Both paths produce list[Image] of length 4 so
+    # the rest of the function is uniform.
+    depth_maps: Optional[list[Image.Image]] = None
+    canny_maps: Optional[list[Image.Image]] = None
 
     if cfg.use_depth:
-        with _timer("build_depth_map"):
-            depth_img = build_depth_map(clean_rgba, device=device, gen_size=gen_size)
+        if extra_views:
+            with _timer("build_view_depth_maps"):
+                depth_maps = build_view_depth_maps(
+                    extra_views, clean_rgba, device=device, gen_size=gen_size
+                )
+        else:
+            with _timer("build_depth_map"):
+                single = build_depth_map(clean_rgba, device=device, gen_size=gen_size)
+                depth_maps = [single] * len(VIEWS)
+
     if cfg.use_canny:
-        with _timer("build_canny_map"):
-            canny_img = build_canny_map(clean_rgba, gen_size=gen_size)
+        if extra_views:
+            with _timer("build_view_canny_maps"):
+                canny_maps = build_view_canny_maps(
+                    extra_views, clean_rgba, gen_size=gen_size
+                )
+        else:
+            with _timer("build_canny_map"):
+                single = build_canny_map(clean_rgba, gen_size=gen_size)
+                canny_maps = [single] * len(VIEWS)
 
     # Build Plücker camera controls (must be on the same device as the pipeline)
     with _timer("build_plucker_controls"):
@@ -390,14 +538,16 @@ def generate_canonical_views(
     with _timer("load_mvadapter_pipe"):
         pipe = load_mvadapter_pipe(cfg, device)
 
-    # Assemble ControlNet inputs
-    controlnet_images: list[Image.Image] = []
+    # Assemble ControlNet inputs.
+    # Each element of controlnet_images is a list of N per-view PIL images (N=4)
+    # so that prepare_control_image routes each map to its corresponding view.
+    controlnet_images: list[list[Image.Image]] = []
     controlnet_scales: list[float] = []
-    if depth_img is not None:
-        controlnet_images.append(depth_img)
+    if depth_maps is not None:
+        controlnet_images.append(depth_maps)
         controlnet_scales.append(cfg.depth_scale)
-    if canny_img is not None:
-        controlnet_images.append(canny_img)
+    if canny_maps is not None:
+        controlnet_images.append(canny_maps)
         controlnet_scales.append(cfg.canny_scale)
 
     # Run generation
@@ -434,6 +584,13 @@ def generate_canonical_views(
     for (name, _), img in zip(VIEWS, result_images):
         canonical[name] = img.convert("RGBA")
 
+    # Collect control images that were actually built (lists of 4 per-view maps).
+    controls: dict[str, list[Image.Image]] = {}
+    if depth_maps is not None:
+        controls["depth"] = depth_maps
+    if canny_maps is not None:
+        controls["canny"] = canny_maps
+
     # Optionally save outputs
     if save_dir is not None:
         save_dir = Path(save_dir)
@@ -441,23 +598,18 @@ def generate_canonical_views(
         (save_dir / "outputs").mkdir(parents=True, exist_ok=True)
 
         anchor_rgb.save(str(save_dir / "preproc" / "anchor.png"))
-        if depth_img:
-            depth_img.save(str(save_dir / "preproc" / "depth.png"))
-        if canny_img:
-            canny_img.save(str(save_dir / "preproc" / "canny.png"))
+
+        for ctrl_name, maps_list in controls.items():
+            for (view_name, _), ctrl_img in zip(VIEWS, maps_list):
+                ctrl_img.save(
+                    str(save_dir / "preproc" / f"{ctrl_name}_{view_name}.png")
+                )
 
         for name, img in canonical.items():
             img.save(str(save_dir / "outputs" / f"{name}.png"))
 
         _save_grid(canonical, save_dir / "grid.png")
         _save_manifest(canonical, cfg, save_dir)
-
-    # Collect control images that were actually built
-    controls: dict[str, Image.Image] = {}
-    if depth_img is not None:
-        controls["depth"] = depth_img
-    if canny_img is not None:
-        controls["canny"] = canny_img
 
     logger.info("Canonical views generated: %s", list(canonical.keys()))
     return canonical, controls
