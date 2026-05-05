@@ -17,6 +17,13 @@ Models downloaded (by key):
     multiview_shape   tencent/Hunyuan3D-2mv   subfolder: hunyuan3d-dit-v2-mv      (~7 GB)   [optional]
     realesrgan        direct URL (GitHub)                                          (~64 MB)
 
+    -- Canonical multiview stage (MV-Adapter) --
+    mv_adapter        huanngzh/mv-adapter                                          (~1 GB)   [optional]
+    sdxl_base         stabilityai/stable-diffusion-xl-base-1.0                    (~7 GB)   [optional]
+    sdxl_vae          madebyollin/sdxl-vae-fp16-fix                               (~160 MB) [optional]
+    dpt_midas         Intel/dpt-hybrid-midas                                       (~400 MB) [optional]
+    controlnet_depth  diffusers/controlnet-depth-sdxl-1.0                         (~2.5 GB) [optional]
+
 The delight model (Light_Shadow_Remover) is part of the Hunyuan3D-2 repo and does
 not have a standalone HuggingFace entry yet — it must be obtained from the cloned
 third_party/Hunyuan3D-2 release assets.
@@ -77,6 +84,47 @@ MODELS: dict[str, dict] = {
         "local_filename": "RealESRGAN_x4plus.pth",
         "description": "RealESRGAN x4plus upscaler (~64 MB)",
         "required": True,
+    },
+    # ── Canonical multiview stage (MV-Adapter) ───────────────────────────────
+    "mv_adapter": {
+        "type": "snapshot",
+        "repo_id": "huanngzh/mv-adapter",
+        "allow_patterns": None,  # full repo (adapter weights + config)
+        "local_dir_suffix": "mv-adapter",
+        "description": "MV-Adapter i2mv SDXL weights (~1 GB) [optional, canonical_multiview stage]",
+        "required": False,
+    },
+    "sdxl_base": {
+        "type": "snapshot",
+        "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
+        "allow_patterns": None,
+        "local_dir_suffix": "sdxl-base-1.0",
+        "description": "SDXL base 1.0 (~7 GB) [optional, canonical_multiview stage]",
+        "required": False,
+    },
+    "sdxl_vae": {
+        "type": "snapshot",
+        "repo_id": "madebyollin/sdxl-vae-fp16-fix",
+        "allow_patterns": None,
+        "local_dir_suffix": "sdxl-vae-fp16-fix",
+        "description": "SDXL VAE fp16-fix (~160 MB) [optional, canonical_multiview stage]",
+        "required": False,
+    },
+    "dpt_midas": {
+        "type": "snapshot",
+        "repo_id": "Intel/dpt-hybrid-midas",
+        "allow_patterns": None,
+        "local_dir_suffix": "dpt-hybrid-midas",
+        "description": "DPT-hybrid-midas depth estimator (~400 MB) [optional, canonical_multiview stage]",
+        "required": False,
+    },
+    "controlnet_depth": {
+        "type": "snapshot",
+        "repo_id": "diffusers/controlnet-depth-sdxl-1.0",
+        "allow_patterns": None,
+        "local_dir_suffix": "controlnet-depth-sdxl",
+        "description": "Depth ControlNet for SDXL (~2.5 GB) [optional, canonical_multiview depth control]",
+        "required": False,
     },
 }
 

@@ -43,7 +43,9 @@ _VIEW_ORDER = ["front", "left", "right", "back"]
 _IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"})
 
 STAGE_IDS = [
-    "preprocess",
+    "remove_background",    # rembg / BiRefNet + erode + center + resize → clean RGBA
+    "canonical_multiview",  # optional: MV-Adapter → front/right/back/left RGBA
+    "preprocess",           # compositing only: white (shape) + gray (paint)
     "mesh_generate",
     "mesh_postprocess",
     "render_multiview",
@@ -54,21 +56,28 @@ STAGE_IDS = [
 ]
 
 STAGE_LABELS = {
-    "preprocess":       "Preprocess",
-    "mesh_generate":    "Mesh Generate",
-    "mesh_postprocess": "Mesh Postprocess",
-    "render_multiview": "Render Multiview",
-    "paint_multiview":  "Paint Multiview",
-    "bake_texture":     "Bake Texture",
-    "inpaint_texture":  "Inpaint Texture",
-    "export_glb":       "Export GLB",
+    "remove_background":   "Remove Background",
+    "canonical_multiview": "Canonical Multiview",
+    "preprocess":          "Preprocess",
+    "mesh_generate":       "Mesh Generate",
+    "mesh_postprocess":    "Mesh Postprocess",
+    "render_multiview":    "Render Multiview",
+    "paint_multiview":     "Paint Multiview",
+    "bake_texture":        "Bake Texture",
+    "inpaint_texture":     "Inpaint Texture",
+    "export_glb":          "Export GLB",
 }
 
+# canonical_multiview requires GPU (SDXL + MV-Adapter, ~14 GB VRAM)
 GPU_REQUIRED = {
+    "canonical_multiview",
     "mesh_generate", "mesh_postprocess",
     "render_multiview", "paint_multiview",
     "bake_texture", "export_glb",
 }
+
+# Stages selected by default (canonical_multiview opt-in only)
+_DEFAULT_STAGE_IDS = [s for s in STAGE_IDS if s != "canonical_multiview"]
 
 # ─── View / image helpers ────────────────────────────────────────────────────
 
@@ -338,42 +347,221 @@ def build_table_html(rows: list[dict], n_views: int) -> str:
 # Each runner signature: (state, save_dir, cfg, log) → (row_dict, Optional[Path])
 # Runners update `state` in-place with objects needed by later stages.
 
-def _stage_preprocess(
+
+def _stage_remove_background(
     state: dict,
     save_dir: Path,
     cfg,
     log,
 ) -> tuple[list[dict], Optional[Path]]:
-    from src.preprocess import collect_views, preprocess_all_views, compose_over_gray
+    """
+    Stage 1 — Subject isolation.
+
+    Loads raw images, runs background removal (rembg / hy3dshape), optional
+    alpha erosion, centering, and resize.  Writes clean RGBA images to
+    ``state["rgba_views"]``.
+
+    Responsibility: *isolation only* — no compositing happens here.
+    """
+    from src.preprocess import (
+        collect_views,
+        maybe_remove_background,
+        erode_alpha,
+        center_and_pad,
+        resize_to_size,
+        compose_over_gray,
+        _build_background_remover,  # type: ignore[attr-defined]
+    )
 
     view_paths: dict[str, Path] = state["view_paths"]
     view_keys  = list(view_paths.keys())
     n_cols     = state["n_views"]
 
     remove_bg      = state.get("remove_bg", True)
+    erode_px       = getattr(cfg, "rembg_erode_px", 0)
     center_subject = state.get("center_subject", True)
     target_size    = state.get("preprocess_target_size")
 
     with log.step("collect_views"):
         raw_views = collect_views(**{k: str(v) for k, v in view_paths.items()})
 
-    with log.step("preprocess_all_views"):
-        processed = preprocess_all_views(
-            raw_views,
-            remove_bg=remove_bg,
-            center_subject=center_subject,
-            target_size=target_size,
+    state["raw_views"] = raw_views
+
+    # Build background remover once; reuse across views.
+    bg_remover = None
+    if remove_bg:
+        bg_remover = _build_background_remover()
+        if bg_remover is None:
+            remove_bg = False
+
+    # Track per-view intermediates for display rows.
+    intermediates: dict[str, dict[str, Image.Image]] = {}
+    for name, img in raw_views.items():
+        entry: dict[str, Image.Image] = {"raw": img.convert("RGBA")}
+
+        with log.step(f"remove_bg({name})") if remove_bg else _noop_ctx():
+            rgba = maybe_remove_background(
+                entry["raw"], remove_bg=remove_bg, background_remover=bg_remover
+            )
+            rgba = erode_alpha(rgba, px=erode_px)
+        entry["rgba"] = rgba
+
+        centered = center_and_pad(rgba) if center_subject else rgba
+        entry["centered"] = centered
+
+        resized = resize_to_size(centered, target_size) if target_size is not None else centered
+        entry["resized"] = resized
+
+        intermediates[name] = entry
+
+    # Store clean RGBA (after all isolation steps) in state.
+    state["rgba_views"] = {name: d["resized"] for name, d in intermediates.items()}
+    log.metric("views", len(intermediates))
+
+    # Save all intermediate images to disk.
+    for orient, entry in intermediates.items():
+        for key, img in entry.items():
+            img.save(str(save_dir / f"{key}_{orient}.png"))
+
+    # --- Build display rows ---
+    def _b64_on_gray(key: str) -> list[Optional[str]]:
+        b64s: list[Optional[str]] = []
+        for orient in view_keys:
+            entry = intermediates.get(orient)
+            if entry and key in entry:
+                pil = entry[key]
+                display = compose_over_gray(pil) if pil.mode == "RGBA" else pil
+                b64s.append(_pil_to_b64(display))
+            else:
+                b64s.append(None)
+        while len(b64s) < n_cols:
+            b64s.append(None)
+        return b64s[:n_cols]
+
+    rows: list[dict] = []
+    rows.append({
+        "stage":   "RB: Raw",
+        "type":    "images",
+        "views":   _b64_on_gray("raw"),
+        "metrics": {"step": "loaded RGBA"},
+    })
+    if remove_bg:
+        rows.append({
+            "stage":   "RB: Rembg",
+            "type":    "images",
+            "views":   _b64_on_gray("rgba"),
+            "metrics": {"step": "bg removed"},
+        })
+    if center_subject:
+        rows.append({
+            "stage":   "RB: Center+Pad",
+            "type":    "images",
+            "views":   _b64_on_gray("centered"),
+            "metrics": {"step": "centered & padded"},
+        })
+    if target_size is not None:
+        rows.append({
+            "stage":   f"RB: Resize→{target_size}",
+            "type":    "images",
+            "views":   _b64_on_gray("resized"),
+            "metrics": {"step": f"→ {target_size}×{target_size} px"},
+        })
+
+    return rows, None
+
+
+def _stage_canonical_multiview(
+    state: dict,
+    save_dir: Path,
+    cfg,
+    log,
+) -> tuple[dict, Optional[Path]]:
+    """
+    Stage 2 — Canonical view synthesis (optional).
+
+    Takes the clean RGBA from ``remove_background`` and uses MV-Adapter i2mv
+    SDXL to generate consistent front / right / back / left canonical views.
+
+    Overwrites ``state["rgba_views"]`` so that the downstream ``preprocess``
+    stage composites the canonical views instead of the original user photos.
+    Also sets ``state["canonical_views"]`` which is kept for ``paint_multiview``
+    to use as the albedo source.
+    """
+    if "rgba_views" not in state:
+        raise RuntimeError("Remove Background must run before Canonical Multiview.")
+
+    from src.canonical_multiview import generate_canonical_views
+    from src.config import CameraConfig
+
+    front_rgba = state["rgba_views"].get("front")
+    if front_rgba is None:
+        raise RuntimeError("No 'front' view found in rgba_views.")
+
+    with log.step("generate_canonical_views"):
+        canonical_views = generate_canonical_views(
+            front_rgba, cfg.canonical, save_dir=save_dir
         )
 
-    # Persist into pipeline state for downstream stages.
+    # Overwrite rgba_views so preprocess composites the canonical RGBA.
+    state["rgba_views"]      = canonical_views
+    state["canonical_views"] = canonical_views
+    state["mode"]            = "multiview"
+    state["n_views"]         = 4
+
+    # Switch bake camera layout to 4 cardinal views.
+    cfg.camera = CameraConfig.four_cardinal()
+
+    log.metric("gen_size", f"{cfg.canonical.gen_size}px")
+    log.metric("steps",    str(cfg.canonical.steps))
+
+    view_b64s = [_pil_to_b64(canonical_views[k]) for k in ["front", "right", "back", "left"]]
+    return {
+        "stage":   STAGE_LABELS["canonical_multiview"],
+        "type":    "images",
+        "views":   view_b64s,
+        "metrics": {
+            "gen_size": f"{cfg.canonical.gen_size}px",
+            "steps":    str(cfg.canonical.steps),
+        },
+    }, None
+
+
+def _stage_preprocess(
+    state: dict,
+    save_dir: Path,
+    cfg,
+    log,
+) -> tuple[list[dict], Optional[Path]]:
+    """
+    Stage 3 — Model formatting (compositing only).
+
+    Composites clean RGBA views (from ``remove_background`` or
+    ``canonical_multiview``) over white (shape DiT) and gray (paint diffusion).
+    No background removal runs here.
+    """
+    if "rgba_views" not in state:
+        raise RuntimeError("Remove Background must run before Preprocess.")
+
+    from src.preprocess import composite_views
+
+    rgba_views = state["rgba_views"]
+    view_keys  = list(rgba_views.keys())
+    n_cols     = state["n_views"]
+
+    with log.step("composite_views"):
+        processed = composite_views(rgba_views)
+
     state["processed"]   = processed
-    state["raw_views"]   = raw_views
     state["shape_views"] = {k: v["shape"] for k, v in processed.items()}
     state["paint_views"] = {k: v["paint"] for k, v in processed.items()}
-    log.metric("views_preprocessed", len(processed))
+    log.metric("views", len(processed))
 
-    def _row_b64s(key: str) -> list[Optional[str]]:
-        """Extract base64 thumbnails for a given intermediate key across all views."""
+    # Save to disk.
+    for orient, entry in processed.items():
+        for key, img in entry.items():
+            img.save(str(save_dir / f"{key}_{orient}.png"))
+
+    def _b64(key: str) -> list[Optional[str]]:
         b64s: list[Optional[str]] = []
         for orient in view_keys:
             entry = processed.get(orient)
@@ -385,82 +573,27 @@ def _stage_preprocess(
             b64s.append(None)
         return b64s[:n_cols]
 
-    def _row_b64s_rgba_on_gray(key: str) -> list[Optional[str]]:
-        """Like _row_b64s but composites the RGBA intermediate over gray for display."""
-        b64s: list[Optional[str]] = []
-        for orient in view_keys:
-            entry = processed.get(orient)
-            if entry and key in entry:
-                img = entry[key]
-                display_img = compose_over_gray(img) if img.mode == "RGBA" else img
-                b64s.append(_pil_to_b64(display_img))
-            else:
-                b64s.append(None)
-        while len(b64s) < n_cols:
-            b64s.append(None)
-        return b64s[:n_cols]
-
-    # Save all intermediates to disk.
-    for orient in view_keys:
-        entry = processed.get(orient, {})
-        for key, img in entry.items():
-            fname = save_dir / f"{key}_{orient}.png"
-            img.save(str(fname))
-
-    rows: list[dict] = []
-
-    # Row: raw input (already in state as input row, but useful in context).
-    rows.append({
-        "stage":   "Pre: Raw",
-        "type":    "images",
-        "views":   _row_b64s_rgba_on_gray("raw"),
-        "metrics": {"step": "loaded RGBA"},
-    })
-
-    # Row: after background removal (only if remove_bg was enabled).
-    if remove_bg:
-        rows.append({
-            "stage":   "Pre: Rembg",
+    rows: list[dict] = [
+        {
+            "stage":   "Pre: Paint ref",
             "type":    "images",
-            "views":   _row_b64s_rgba_on_gray("rgba"),
-            "metrics": {"step": "background removed"},
-        })
-
-    # Row: after center+pad (only if enabled).
-    if center_subject:
-        rows.append({
-            "stage":   "Pre: Center+Pad",
+            "views":   _b64("paint"),
+            "metrics": {"step": "gray composite (paint)"},
+        },
+        {
+            "stage":   "Pre: Shape ref",
             "type":    "images",
-            "views":   _row_b64s_rgba_on_gray("centered"),
-            "metrics": {"step": "centered & padded"},
-        })
-
-    # Row: after resize (only if a target size was set).
-    if target_size is not None:
-        rows.append({
-            "stage":   f"Pre: Resize→{target_size}",
-            "type":    "images",
-            "views":   _row_b64s_rgba_on_gray("resized"),
-            "metrics": {"step": f"→ {target_size}×{target_size} px"},
-        })
-
-    # Row: paint reference (gray composite — what the paint model sees).
-    rows.append({
-        "stage":   "Pre: Paint ref",
-        "type":    "images",
-        "views":   _row_b64s("paint"),
-        "metrics": {"step": "gray composite (paint)"},
-    })
-
-    # Row: shape reference (white composite — what the shape DiT sees).
-    rows.append({
-        "stage":   "Pre: Shape ref",
-        "type":    "images",
-        "views":   _row_b64s("shape"),
-        "metrics": {"step": "white composite (shape)"},
-    })
-
+            "views":   _b64("shape"),
+            "metrics": {"step": "white composite (shape)"},
+        },
+    ]
     return rows, None
+
+
+class _noop_ctx:
+    """No-op context manager used as a drop-in when a step should be skipped."""
+    def __enter__(self):  return self
+    def __exit__(self, *_): pass
 
 
 def _stage_mesh_generate(
@@ -599,27 +732,46 @@ def _stage_paint_multiview(
     from src.paint_multiview import MultiviewDiffusionNet, delight_reference, upscale_views
     from src.preprocess import load_image_rgba
 
-    paint_pipeline = state["paint_pipeline"]
-    front_path     = state["view_paths"]["front"]
+    paint_pipeline   = state["paint_pipeline"]
+    canonical_views  = state.get("canonical_views")  # set by canonical_multiview stage
+
+    # Use canonical front view as delight reference if available (it's the
+    # MV-Adapter-generated anchor which is already clean and well-lit).
+    if canonical_views is not None:
+        front_rgba = canonical_views["front"].convert("RGBA")
+    else:
+        front_path = state["view_paths"]["front"]
+        front_rgba = load_image_rgba(front_path)
 
     with log.step("delight_reference"):
-        front_rgba = load_image_rgba(front_path)
-        reference  = delight_reference(front_rgba, cfg)
+        reference = delight_reference(front_rgba, cfg)
         reference.save(str(save_dir / "reference_delighted.png"))
 
     with log.step("MultiviewDiffusionNet init"):
         mvd = MultiviewDiffusionNet(cfg)
 
     with log.step(f"paint diffusion (steps={cfg.paint_steps})"):
-        paint_out   = mvd(reference, state["normal_maps"], state["position_maps"], cfg)
-        albedo_views = paint_out["albedo"]
+        paint_out    = mvd(reference, state["normal_maps"], state["position_maps"], cfg)
         mr_views     = paint_out["mr"]
-        log.metric("albedo_views", len(albedo_views))
-        log.metric("mr_views",     len(mr_views))
+        log.metric("mr_views", len(mr_views))
 
+    # When canonical views are available, use them as albedo and take only the
+    # MR channel from HunyuanPaint (which is conditioned on normals/positions).
     with log.step("upscale_views"):
-        albedo_up = upscale_views(albedo_views, target_size=cfg.render_size)
-        mr_up     = upscale_views(mr_views,     target_size=cfg.render_size)
+        if canonical_views is not None:
+            canon_order = ["front", "right", "back", "left"]
+            albedo_up = upscale_views(
+                [canonical_views[k].convert("RGB") for k in canon_order],
+                target_size=cfg.render_size,
+            )
+            mr_up = upscale_views(mr_views[:4], target_size=cfg.render_size)
+            log.metric("albedo_source", "canonical_views")
+        else:
+            albedo_views = paint_out["albedo"]
+            albedo_up = upscale_views(albedo_views, target_size=cfg.render_size)
+            mr_up     = upscale_views(mr_views,     target_size=cfg.render_size)
+            log.metric("albedo_source",  "hunyuan_paint")
+            log.metric("albedo_views",   len(albedo_views))
 
     for i, img in enumerate(albedo_up):
         img.save(str(save_dir / f"albedo_upscaled_{i:02d}.png"))
@@ -777,14 +929,16 @@ def _stage_export_glb(
 
 
 _RUNNERS = {
-    "preprocess":       _stage_preprocess,
-    "mesh_generate":    _stage_mesh_generate,
-    "mesh_postprocess": _stage_mesh_postprocess,
-    "render_multiview": _stage_render_multiview,
-    "paint_multiview":  _stage_paint_multiview,
-    "bake_texture":     _stage_bake_texture,
-    "inpaint_texture":  _stage_inpaint_texture,
-    "export_glb":       _stage_export_glb,
+    "remove_background":   _stage_remove_background,
+    "canonical_multiview": _stage_canonical_multiview,
+    "preprocess":          _stage_preprocess,
+    "mesh_generate":       _stage_mesh_generate,
+    "mesh_postprocess":    _stage_mesh_postprocess,
+    "render_multiview":    _stage_render_multiview,
+    "paint_multiview":     _stage_paint_multiview,
+    "bake_texture":        _stage_bake_texture,
+    "inpaint_texture":     _stage_inpaint_texture,
+    "export_glb":          _stage_export_glb,
 }
 
 
@@ -814,9 +968,19 @@ def run_pipeline(
     input_folder: str,
     selected_stages: list[str],
     output_format: str = "glb",
+    # --- remove_background params ---
     remove_bg: bool = True,
     center_subject: bool = True,
     preprocess_target_size: Optional[int] = None,
+    # --- canonical_multiview params ---
+    canonical_steps: int = 50,
+    canonical_guidance: float = 3.0,
+    canonical_ref_scale: float = 1.0,
+    canonical_use_depth: bool = True,
+    canonical_depth_scale: float = 0.5,
+    canonical_use_canny: bool = False,
+    canonical_canny_scale: float = 0.2,
+    canonical_prompt: str = "high quality",
 ):
     """
     Gradio generator: yields (html_table, mesh_path_or_None) after each stage.
@@ -877,6 +1041,16 @@ def run_pipeline(
 
     latest_mesh: Optional[str] = None
     yield build_table_html(rows, n_views), latest_mesh
+
+    # ---- Apply canonical multiview config to cfg ----------------------------
+    cfg.canonical.steps                        = canonical_steps
+    cfg.canonical.guidance_scale               = canonical_guidance
+    cfg.canonical.reference_conditioning_scale = canonical_ref_scale
+    cfg.canonical.use_depth                    = canonical_use_depth
+    cfg.canonical.depth_scale                  = canonical_depth_scale
+    cfg.canonical.use_canny                    = canonical_use_canny
+    cfg.canonical.canny_scale                  = canonical_canny_scale
+    cfg.canonical.prompt                       = canonical_prompt
 
     # ---- Pipeline state accumulated across stages ---------------------------
     from src.mesh_io import MeshSaver
@@ -1005,15 +1179,16 @@ def _build_ui() -> gr.Blocks:
 
             stage_checkboxes = gr.CheckboxGroup(
                 choices=[(STAGE_LABELS[s], s) for s in STAGE_IDS],
-                value=STAGE_IDS,
+                value=_DEFAULT_STAGE_IDS,
                 label="Pipeline stages",
                 info="Stages run in dependency order. "
-                     "GPU-required stages will be skipped automatically on CPU.",
+                     "GPU-required stages will be skipped automatically on CPU. "
+                     "Canonical Multiview is opt-in (requires ~14 GB VRAM).",
             )
 
-            with gr.Accordion("Preprocessing Options", open=False):
+            with gr.Accordion("Remove Background Options", open=False):
                 gr.Markdown(
-                    "Controls applied during the **Preprocess** stage. "
+                    "Controls applied during the **Remove Background** stage. "
                     "Each enabled step is shown as a separate row in the results table."
                 )
                 with gr.Row():
@@ -1041,6 +1216,73 @@ def _build_ui() -> gr.Blocks:
                         step=1,
                         info="Only used when 'Resize to canonical size' is checked.",
                     )
+
+            with gr.Accordion("Canonical Multiview (MV-Adapter)", open=False):
+                gr.Markdown(
+                    "**Optional stage** — uses MV-Adapter i2mv SDXL to generate consistent "
+                    "`front / right / back / left` canonical views from a single anchor photo. "
+                    "Requires ~14 GB VRAM. Enable by checking the stage above. "
+                    "The canonical views replace HunyuanPaint albedo for higher texture fidelity."
+                )
+                with gr.Row():
+                    canon_steps_num = gr.Number(
+                        label="Steps",
+                        value=50,
+                        minimum=1,
+                        maximum=100,
+                        step=1,
+                        info="Diffusion steps (50 = quality; 8–12 = preview).",
+                    )
+                    canon_guidance_num = gr.Number(
+                        label="Guidance scale",
+                        value=3.0,
+                        minimum=1.0,
+                        maximum=10.0,
+                        step=0.1,
+                        info="CFG guidance scale (default: 3.0).",
+                    )
+                    canon_ref_scale_num = gr.Number(
+                        label="Reference conditioning scale",
+                        value=1.0,
+                        minimum=0.1,
+                        maximum=2.0,
+                        step=0.05,
+                        info="How strongly the anchor photo guides generation (default: 1.0).",
+                    )
+                with gr.Row():
+                    canon_use_depth_chk = gr.Checkbox(
+                        label="Depth control (DPT-midas)",
+                        value=True,
+                        info="Adds depth ControlNet for structural stability.",
+                    )
+                    canon_depth_scale_num = gr.Number(
+                        label="Depth scale",
+                        value=0.5,
+                        minimum=0.0,
+                        maximum=1.5,
+                        step=0.05,
+                        info="ControlNet conditioning scale for depth (0.4–0.6 recommended).",
+                    )
+                with gr.Row():
+                    canon_use_canny_chk = gr.Checkbox(
+                        label="Canny edge control",
+                        value=False,
+                        info="Adds weak canny ControlNet for silhouette edges.",
+                    )
+                    canon_canny_scale_num = gr.Number(
+                        label="Canny scale",
+                        value=0.2,
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        info="ControlNet conditioning scale for canny (0.15–0.3 recommended).",
+                    )
+                canon_prompt_box = gr.Textbox(
+                    label="Generation prompt",
+                    value="high quality",
+                    placeholder="e.g. high quality industrial marine ship",
+                    info="Text prompt passed to SDXL during canonical view generation.",
+                )
 
             with gr.Row():
                 output_format_dropdown = gr.Dropdown(
@@ -1086,6 +1328,14 @@ def _build_ui() -> gr.Blocks:
             center_subject,
             resize_enabled,
             resize_size,
+            canon_steps,
+            canon_guidance,
+            canon_ref_scale,
+            canon_use_depth,
+            canon_depth_scale,
+            canon_use_canny,
+            canon_canny_scale,
+            canon_prompt,
         ):
             target_size = int(resize_size) if resize_enabled else None
             yield from run_pipeline(
@@ -1096,6 +1346,14 @@ def _build_ui() -> gr.Blocks:
                 remove_bg=remove_bg,
                 center_subject=center_subject,
                 preprocess_target_size=target_size,
+                canonical_steps=int(canon_steps),
+                canonical_guidance=float(canon_guidance),
+                canonical_ref_scale=float(canon_ref_scale),
+                canonical_use_depth=canon_use_depth,
+                canonical_depth_scale=float(canon_depth_scale),
+                canonical_use_canny=canon_use_canny,
+                canonical_canny_scale=float(canon_canny_scale),
+                canonical_prompt=canon_prompt,
             )
 
         run_btn.click(
@@ -1109,6 +1367,14 @@ def _build_ui() -> gr.Blocks:
                 center_subject_chk,
                 resize_chk,
                 resize_size_num,
+                canon_steps_num,
+                canon_guidance_num,
+                canon_ref_scale_num,
+                canon_use_depth_chk,
+                canon_depth_scale_num,
+                canon_use_canny_chk,
+                canon_canny_scale_num,
+                canon_prompt_box,
             ],
             outputs=[results_html, model3d_viewer],
         )

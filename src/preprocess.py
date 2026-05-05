@@ -504,6 +504,88 @@ def preprocess_view(
     return compose_over_gray(rgba, gray=gray)
 
 
+def prepare_rgba_views(
+    views: dict[str, Image.Image],
+    *,
+    remove_bg: bool = True,
+    erode_px: int = 0,
+    center_subject: bool = True,
+    target_size: Optional[int] = None,
+) -> dict[str, Image.Image]:
+    """
+    Background removal + erode + center + resize — return clean RGBA per view.
+
+    This is the "subject isolation" half of the preprocessing chain, separated
+    so that ``canonical_multiview`` (which follows) can receive already-clean
+    RGBA without duplicating background removal.
+
+    Args:
+        views:          Dict of view name → RGBA PIL image (from collect_views).
+        remove_bg:      Whether to run background removal.
+        erode_px:       Pixels to erode from alpha mask edge after rembg (0 = off).
+        center_subject: Crop to subject bbox, extend to square, add 10% margin.
+        target_size:    Resize to this square side length. None = no resize.
+
+    Returns:
+        Dict mapping each view name to a clean RGBA image.
+    """
+    background_remover = None
+    if remove_bg:
+        background_remover = _build_background_remover()
+        if background_remover is None:
+            remove_bg = False
+
+    result: dict[str, Image.Image] = {}
+    for name, img in views.items():
+        rgba = maybe_remove_background(
+            img.convert("RGBA"),
+            remove_bg=remove_bg,
+            background_remover=background_remover,
+        )
+        rgba = erode_alpha(rgba, px=erode_px)
+        if center_subject:
+            rgba = center_and_pad(rgba)
+        if target_size is not None:
+            rgba = resize_to_size(rgba, target_size)
+        result[name] = rgba
+        logger.debug("prepare_rgba_views: processed view '%s'.", name)
+    return result
+
+
+def composite_views(
+    rgba_views: dict[str, Image.Image],
+    *,
+    gray: int = 127,
+) -> dict[str, dict[str, Image.Image]]:
+    """
+    Composite clean RGBA views over white and gray backgrounds.
+
+    This is the "model formatting" half of the preprocessing chain — it expects
+    clean RGBA as input (from ``prepare_rgba_views`` or ``canonical_multiview``)
+    and performs no background removal of its own.
+
+    Args:
+        rgba_views: Dict of view name → clean RGBA image.
+        gray:       Background luminance for the paint composite (0–255).
+
+    Returns:
+        Dict mapping each view name to a sub-dict with keys:
+            ``"rgba"``  — the input RGBA image (passed through unchanged)
+            ``"shape"`` — RGB composited over white  (for shape DiT)
+            ``"paint"`` — RGB composited over gray   (for paint diffusion)
+    """
+    result: dict[str, dict[str, Image.Image]] = {}
+    for name, img in rgba_views.items():
+        rgba = img.convert("RGBA")
+        result[name] = {
+            "rgba":  rgba,
+            "shape": compose_over_white(rgba),
+            "paint": compose_over_gray(rgba, gray=gray),
+        }
+        logger.debug("composite_views: composited view '%s'.", name)
+    return result
+
+
 def preprocess_all_views(
     views: dict[str, Image.Image],
     *,

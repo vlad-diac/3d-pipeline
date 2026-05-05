@@ -17,6 +17,41 @@ from typing import List
 
 
 @dataclass
+class CanonicalMultiviewConfig:
+    """
+    Configuration for the optional canonical multiview generation stage.
+
+    Uses MV-Adapter i2mv SDXL with an optional depth / canny ControlNet branch
+    to synthesise consistent front / right / back / left views from a single
+    clean RGBA anchor image produced by the ``remove_background`` stage.
+    """
+
+    enabled: bool = False
+
+    # ------------------------------------------------- model identifiers
+    adapter_repo: str = "huanngzh/mv-adapter"
+    adapter_weight: str = "mvadapter_i2mv_sdxl_beta.safetensors"
+    base_model: str = "stabilityai/stable-diffusion-xl-base-1.0"
+    vae_model: str = "madebyollin/sdxl-vae-fp16-fix"
+
+    # ------------------------------------------- generation parameters
+    gen_size: int = 768
+    steps: int = 50
+    guidance_scale: float = 3.0
+    reference_conditioning_scale: float = 1.0
+
+    # -------------------------------------------- structural controls
+    use_depth: bool = True
+    depth_scale: float = 0.5
+    use_canny: bool = False
+    canny_scale: float = 0.2
+
+    # ------------------------------------------------ diffusion prompt
+    prompt: str = "high quality"
+    negative_prompt: str = "watermark, ugly, deformed, noisy, blurry, low contrast"
+
+
+@dataclass
 class CameraConfig:
     """
     Six-camera layout for multiview texture rendering and baking.
@@ -52,6 +87,22 @@ class CameraConfig:
             )
         if n < 1:
             raise ValueError("CameraConfig requires at least one view.")
+
+    @classmethod
+    def four_cardinal(cls) -> "CameraConfig":
+        """
+        Four-camera layout matching MV-Adapter's canonical azimuths.
+
+        Used when the ``canonical_multiview`` stage is active.  The four
+        cardinal views (front/right/back/left at 0/90/180/270°) replace the
+        default six-camera layout.  Top and bottom texels that would have been
+        covered by the top/bottom cameras are filled by the inpaint stage.
+        """
+        return cls(
+            azimuths=[0, 90, 180, 270],
+            elevations=[0, 0, 0, 0],
+            weights=[1.0, 0.4, 0.6, 0.4],
+        )
 
 
 @dataclass
@@ -91,6 +142,11 @@ class PipelineConfig:
 
     # ---------------------------------------------------------------- cameras
     camera: CameraConfig = field(default_factory=CameraConfig)
+
+    # ------------------------------------------ canonical multiview stage
+    canonical: CanonicalMultiviewConfig = field(
+        default_factory=CanonicalMultiviewConfig
+    )
 
     # ----------------------------------------------- paint / texture settings
     # Diffusion view resolution (model input size).

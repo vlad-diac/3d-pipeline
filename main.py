@@ -1,7 +1,19 @@
 """
 Hunyuan3D Multiview Pipeline — CLI entry point.
 
-Wires all pipeline stages (A–O) into a single, resumable command.
+Wires all pipeline stages into a single, resumable command.
+
+Stage order:
+  remove_background  — rembg + center + resize → clean RGBA
+  canonical_multiview— MV-Adapter i2mv SDXL → front/right/back/left (opt-in)
+  preprocess         — white/gray compositing for shape/paint models
+  mesh_generate      — Hunyuan3D DiT → raw mesh
+  mesh_postprocess   — cleanup + decimation
+  render_multiview   — UV unwrap + conditioning maps
+  paint_multiview    — HunyuanPaint MR; canonical views as albedo when active
+  bake_texture       — cosine-weighted UV back-projection
+  inpaint_texture    — two-pass UV hole filling
+  export_glb         — PBR GLB export
 
 Usage:
   # Single-image mode (Path A — v2.1 single-image DiT)
@@ -20,23 +32,18 @@ Usage:
       --use-multiview-shape \\
       --shape-steps 30
 
+  # Canonical multiview (MV-Adapter generates consistent 4-view dataset)
+  python main.py \\
+      --image inputs/front.png \\
+      --output outputs/model.glb \\
+      --canonical-multiview \\
+      --canonical-use-depth
+
   # Mesh-only (skip texturing)
   python main.py --image inputs/front.png --output outputs/model.glb --no-texture
 
   # Full pipeline with all intermediate outputs saved
   python main.py --image inputs/front.png --output outputs/model.glb --save-intermediates
-
-Intermediate output structure (--save-intermediates):
-  outputs/model/
-    01_preprocessed/
-    02_mesh/
-    03_normal_maps/
-    04_position_maps/
-    05_reference/
-    06_mv_albedo/
-    07_mv_mr/
-    08_bake/
-    09_refine/
 
 Dual-platform note:
   - macOS: All imports succeed; GPU stages (shape gen, paint, render) raise
@@ -198,6 +205,51 @@ examples:
         help="Disable vertex-aware inpainting (pass 1); use cv2 only.",
     )
 
+    # ---- Canonical multiview (MV-Adapter) -----------------------------------
+    canon_group = parser.add_argument_group(
+        "canonical multiview parameters (--canonical-multiview)"
+    )
+    canon_group.add_argument(
+        "--canonical-multiview", action="store_true",
+        help=(
+            "Run the canonical_multiview stage (MV-Adapter i2mv SDXL) before "
+            "preprocess. Generates consistent front/right/back/left views from "
+            "the anchor image. Requires ~14 GB VRAM."
+        ),
+    )
+    canon_group.add_argument(
+        "--canonical-steps", type=int, default=50, metavar="N",
+        help="MV-Adapter diffusion steps (default: 50).",
+    )
+    canon_group.add_argument(
+        "--canonical-guidance", type=float, default=3.0, metavar="SCALE",
+        help="MV-Adapter guidance scale (default: 3.0).",
+    )
+    canon_group.add_argument(
+        "--canonical-ref-scale", type=float, default=1.0, metavar="SCALE",
+        help="MV-Adapter reference conditioning scale (default: 1.0).",
+    )
+    canon_group.add_argument(
+        "--canonical-use-depth", action="store_true",
+        help="Add depth ControlNet conditioning (DPT-hybrid-midas).",
+    )
+    canon_group.add_argument(
+        "--canonical-depth-scale", type=float, default=0.5, metavar="SCALE",
+        help="Depth ControlNet scale (default: 0.5).",
+    )
+    canon_group.add_argument(
+        "--canonical-use-canny", action="store_true",
+        help="Add weak canny edge ControlNet conditioning.",
+    )
+    canon_group.add_argument(
+        "--canonical-canny-scale", type=float, default=0.2, metavar="SCALE",
+        help="Canny ControlNet scale (default: 0.2).",
+    )
+    canon_group.add_argument(
+        "--canonical-prompt", type=str, default="high quality", metavar="TEXT",
+        help="Generation prompt for MV-Adapter (default: 'high quality').",
+    )
+
     # ---- Reproducibility / misc ---------------------------------------------
     parser.add_argument(
         "--seed", type=int, default=42, metavar="N",
@@ -236,53 +288,90 @@ def _save_images(images, directory: Path, prefix: str) -> None:
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
-def _run_preprocess(args, cfg, intermediates_root: Path | None):
-    """Steps A + B: load images, run optional background removal."""
-    from src.preprocess import (
-        load_image_rgba,
-        compose_over_white,
-        compose_over_gray,
-        collect_views,
-        preprocess_all_views,
-        scan_multiview_folder,
-    )
+def _run_remove_background(args, cfg, intermediates_root: Path | None):
+    """Stage 1 — Load images, run background removal, center, resize → clean RGBA."""
+    from src.preprocess import collect_views, prepare_rgba_views, load_image_rgba
 
-    print("\n[preprocess] Loading and preprocessing input images ...")
+    print("\n[remove_background] Loading images and removing backgrounds ...")
 
-    # --- resolve front reference for the paint model -----------------------
     if args.image:
         logger.info("Mode: single-image  path=%s", args.image)
-        front_rgba = load_image_rgba(args.image)
-        shape_views = {"front": compose_over_white(front_rgba)}
+        raw = {"front": load_image_rgba(args.image)}
         cfg.use_multiview_shape = False
-
     elif args.front:
         logger.info("Mode: four-view  front=%s", args.front)
-        raw_views = collect_views(
+        raw = collect_views(
             front=str(args.front),
             left=str(args.left) if args.left else None,
             right=str(args.right) if args.right else None,
             back=str(args.back) if args.back else None,
         )
-        processed = preprocess_all_views(raw_views, remove_bg=args.remove_bg)
-        shape_views = {k: v["shape"] for k, v in processed.items()}
-        front_rgba = load_image_rgba(args.front)
         cfg.use_multiview_shape = True
-
     else:
         raise ValueError(
             "Provide --image for single-image mode or --front for four-view mode."
         )
 
-    if intermediates_root is not None:
-        d = _stage_dir(intermediates_root, 1, "preprocessed")
-        if args.image:
-            front_rgba.save(str(d / "front.png"))
-        else:
-            for name, img in shape_views.items():
-                img.save(str(d / f"{name}.png"))
+    rgba_views = prepare_rgba_views(raw, remove_bg=args.remove_bg)
 
-    return front_rgba, shape_views
+    if intermediates_root is not None:
+        d = _stage_dir(intermediates_root, 1, "remove_background")
+        for name, img in rgba_views.items():
+            img.save(str(d / f"{name}.png"))
+
+    return rgba_views
+
+
+def _run_canonical_multiview(args, rgba_views, cfg, intermediates_root: Path | None):
+    """Stage 2 (optional) — MV-Adapter i2mv SDXL → canonical 4 views."""
+    if not args.canonical_multiview:
+        return None
+
+    from src.canonical_multiview import generate_canonical_views
+    from src.config import CameraConfig
+
+    print("\n[canonical_multiview] Generating canonical front/right/back/left views ...")
+
+    # Apply CLI args to cfg.canonical
+    cfg.canonical.steps                        = args.canonical_steps
+    cfg.canonical.guidance_scale               = args.canonical_guidance
+    cfg.canonical.reference_conditioning_scale = args.canonical_ref_scale
+    cfg.canonical.use_depth                    = args.canonical_use_depth
+    cfg.canonical.depth_scale                  = args.canonical_depth_scale
+    cfg.canonical.use_canny                    = args.canonical_use_canny
+    cfg.canonical.canny_scale                  = args.canonical_canny_scale
+    cfg.canonical.prompt                       = args.canonical_prompt
+
+    save_dir = _stage_dir(intermediates_root, 2, "canonical_multiview") \
+               if intermediates_root else None
+
+    front_rgba = rgba_views["front"]
+    canonical_views = generate_canonical_views(front_rgba, cfg.canonical, save_dir=save_dir)
+
+    # Switch to 4-camera layout for downstream bake
+    cfg.camera = CameraConfig.four_cardinal()
+    cfg.use_multiview_shape = True
+
+    logger.info("Canonical views: %s", list(canonical_views.keys()))
+    return canonical_views
+
+
+def _run_preprocess(rgba_views, cfg, intermediates_root: Path | None, stage_num: int = 3):
+    """Stage 3 — Compositing only: white (shape) + gray (paint) from clean RGBA."""
+    from src.preprocess import composite_views
+
+    print("\n[preprocess] Compositing views for shape/paint models ...")
+
+    processed = composite_views(rgba_views)
+    shape_views = {k: v["shape"] for k, v in processed.items()}
+
+    if intermediates_root is not None:
+        d = _stage_dir(intermediates_root, stage_num, "preprocess")
+        for name, entry in processed.items():
+            entry["shape"].save(str(d / f"shape_{name}.png"))
+            entry["paint"].save(str(d / f"paint_{name}.png"))
+
+    return shape_views
 
 
 def _run_mesh_generate(args, shape_views, cfg, intermediates_root: Path | None):
@@ -367,9 +456,19 @@ def _run_uv_and_render(post_mesh, cfg, intermediates_root: Path | None):
 
 
 def _run_paint(
-    front_rgba, normal_maps, position_maps, cfg, intermediates_root: Path | None
+    front_rgba,
+    normal_maps,
+    position_maps,
+    cfg,
+    intermediates_root: Path | None,
+    *,
+    canonical_views=None,
 ):
-    """Steps J + K + L: delight, multiview diffusion, upscale."""
+    """Steps J + K + L: delight, multiview diffusion, upscale.
+
+    When ``canonical_views`` is provided the canonical RGB views are used as
+    albedo and HunyuanPaint contributes only the MR channel.
+    """
     from src.paint_multiview import MultiviewDiffusionNet, delight_reference, upscale_views
 
     print("\n[paint] Delight reference image ...")
@@ -389,31 +488,49 @@ def _run_paint(
     t0 = time.perf_counter()
     paint_out = mvd(reference, normal_maps, position_maps, cfg)
     elapsed = time.perf_counter() - t0
-    albedo_views = paint_out["albedo"]
     mr_views = paint_out["mr"]
-    logger.info(
-        "Diffusion done in %.1f s — %d albedo views, %d MR views.",
-        elapsed, len(albedo_views), len(mr_views),
-    )
+    logger.info("Diffusion done in %.1f s — %d MR views.", elapsed, len(mr_views))
 
     if intermediates_root is not None:
-        _save_images(albedo_views, _stage_dir(intermediates_root, 6, "mv_albedo"), "albedo")
-        _save_images(mr_views,     _stage_dir(intermediates_root, 7, "mv_mr"),     "mr")
+        if canonical_views is None:
+            albedo_views = paint_out["albedo"]
+            _save_images(albedo_views, _stage_dir(intermediates_root, 6, "mv_albedo"), "albedo")
+        _save_images(mr_views, _stage_dir(intermediates_root, 7, "mv_mr"), "mr")
 
     print(f"\n[paint] Upscaling views to {cfg.render_size} px ...")
     ckpt = cfg.models_dir / "RealESRGAN_x4plus.pth" if cfg.use_realesrgan else None
-    albedo_up = upscale_views(
-        albedo_views,
-        cfg.render_size,
-        use_realesrgan=cfg.use_realesrgan,
-        realesrgan_ckpt=ckpt,
-    )
-    mr_up = upscale_views(
-        mr_views,
-        cfg.render_size,
-        use_realesrgan=cfg.use_realesrgan,
-        realesrgan_ckpt=ckpt,
-    )
+
+    if canonical_views is not None:
+        # Use canonical views as albedo; HunyuanPaint only provides MR.
+        canon_order = ["front", "right", "back", "left"]
+        albedo_up = upscale_views(
+            [canonical_views[k].convert("RGB") for k in canon_order],
+            cfg.render_size,
+            use_realesrgan=cfg.use_realesrgan,
+            realesrgan_ckpt=ckpt,
+        )
+        mr_up = upscale_views(
+            mr_views[:4],
+            cfg.render_size,
+            use_realesrgan=cfg.use_realesrgan,
+            realesrgan_ckpt=ckpt,
+        )
+        logger.info("Albedo source: canonical_views (%d views).", len(albedo_up))
+    else:
+        albedo_views = paint_out["albedo"]
+        albedo_up = upscale_views(
+            albedo_views,
+            cfg.render_size,
+            use_realesrgan=cfg.use_realesrgan,
+            realesrgan_ckpt=ckpt,
+        )
+        mr_up = upscale_views(
+            mr_views,
+            cfg.render_size,
+            use_realesrgan=cfg.use_realesrgan,
+            realesrgan_ckpt=ckpt,
+        )
+        logger.info("Albedo source: hunyuan_paint (%d views).", len(albedo_up))
 
     mvd.unload()
     try:
@@ -520,6 +637,7 @@ def main() -> None:
     cfg.inpaint_method        = args.inpaint_method
     cfg.vertex_inpaint        = not args.no_vertex_inpaint
     cfg.seed                  = args.seed
+    # canonical args applied later in _run_canonical_multiview
 
     # ---- Intermediate outputs root -----------------------------------------
     output_path = Path(args.output).with_suffix(".glb")
@@ -529,11 +647,34 @@ def main() -> None:
         intermediates_root.mkdir(parents=True, exist_ok=True)
         logger.info("Saving intermediates to %s.", intermediates_root)
 
+    # ---- Apply canonical multiview config -----------------------------------
+    cfg.canonical.steps                        = args.canonical_steps
+    cfg.canonical.guidance_scale               = args.canonical_guidance
+    cfg.canonical.reference_conditioning_scale = args.canonical_ref_scale
+    cfg.canonical.use_depth                    = args.canonical_use_depth
+    cfg.canonical.depth_scale                  = args.canonical_depth_scale
+    cfg.canonical.use_canny                    = args.canonical_use_canny
+    cfg.canonical.canny_scale                  = args.canonical_canny_scale
+    cfg.canonical.prompt                       = args.canonical_prompt
+
     # ---- Run pipeline -------------------------------------------------------
     t_start = time.perf_counter()
 
     try:
-        front_rgba, shape_views = _run_preprocess(args, cfg, intermediates_root)
+        # Stage 1: load + background removal → clean RGBA
+        rgba_views = _run_remove_background(args, cfg, intermediates_root)
+
+        # Stage 2 (optional): MV-Adapter canonical views
+        canonical_views = _run_canonical_multiview(args, rgba_views, cfg, intermediates_root)
+
+        # Use canonical views downstream if generated
+        active_rgba_views = canonical_views if canonical_views is not None else rgba_views
+
+        # Stage 3: white/gray compositing → shape_views
+        shape_views = _run_preprocess(active_rgba_views, cfg, intermediates_root, stage_num=3)
+
+        # The front reference for paint is the canonical front (if available) or original
+        front_rgba = active_rgba_views["front"]
 
         raw_mesh   = _run_mesh_generate(args, shape_views, cfg, intermediates_root)
         post_mesh  = _run_postprocess(raw_mesh, cfg, intermediates_root)
@@ -548,7 +689,8 @@ def main() -> None:
             post_mesh, cfg, intermediates_root
         )
         albedo_up, mr_up = _run_paint(
-            front_rgba, normal_maps, position_maps, cfg, intermediates_root
+            front_rgba, normal_maps, position_maps, cfg, intermediates_root,
+            canonical_views=canonical_views,
         )
         texture_albedo, mask_albedo, texture_mr, mask_mr = _run_bake(
             paint_pipeline, albedo_up, mr_up, cfg, intermediates_root
