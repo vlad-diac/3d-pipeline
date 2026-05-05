@@ -290,13 +290,14 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
         pipe_kwargs["controlnet"] = controlnets if len(controlnets) > 1 else controlnets[0]
 
     pipe = PipelineClass.from_pretrained(cfg.base_model, **pipe_kwargs)
-    pipe.to(device)  # move SDXL weights to GPU before loading the adapter on top
+    pipe.to(device)  # stream SDXL weights from meta tensors directly to GPU
     pipe.init_custom_adapter(num_views=len(VIEWS))
     pipe.load_custom_adapter(cfg.adapter_repo, weight_name=cfg.adapter_weight)
+    # Second sweep: init_custom_adapter / load_custom_adapter add new modules after
+    # the first pipe.to(device), which leaves them on CPU. This ensures every
+    # sub-module (including cond_encoder and adapter layers) is on the target device.
+    pipe.to(device=device, dtype=torch.float16)
     pipe.enable_vae_slicing()
-
-    if hasattr(pipe, "cond_encoder"):
-        pipe.cond_encoder.to(device=device, dtype=torch.float16)
 
     return pipe
 
@@ -371,9 +372,12 @@ def generate_canonical_views(
         with _timer("build_canny_map"):
             canny_img = build_canny_map(clean_rgba, gen_size=gen_size)
 
-    # Build Plücker camera controls
+    # Build Plücker camera controls (must be on the same device as the pipeline)
     with _timer("build_plucker_controls"):
-        plucker_controls = build_plucker_controls(gen_size, device)
+        import torch as _torch
+        plucker_controls = build_plucker_controls(gen_size, device).to(
+            device=device, dtype=_torch.float16
+        )
 
     # Load pipeline
     with _timer("load_mvadapter_pipe"):
