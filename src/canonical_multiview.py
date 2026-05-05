@@ -227,7 +227,9 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
 
     _add_mvadapter_to_path()
 
-    vae = AutoencoderKL.from_pretrained(cfg.vae_model, torch_dtype=torch.float16)
+    vae = AutoencoderKL.from_pretrained(
+        cfg.vae_model, torch_dtype=torch.float16
+    ).to(device)
 
     want_controlnet = cfg.use_depth or cfg.use_canny
     controlnets = []
@@ -241,7 +243,7 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
                     variant="fp16",
                     use_safetensors=True,
                     torch_dtype=torch.float16,
-                )
+                ).to(device)
             )
         if cfg.use_canny:
             logger.info("Loading canny ControlNet ...")
@@ -249,7 +251,7 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
                 ControlNetModel.from_pretrained(
                     "diffusers/controlnet-canny-sdxl-1.0",
                     torch_dtype=torch.float16,
-                )
+                ).to(device)
             )
 
     # Try local ControlNet fork first; fall back to standard i2mv if absent.
@@ -282,15 +284,16 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
     pipe_kwargs: dict = {
         "vae": vae,
         "torch_dtype": torch.float16,
+        "low_cpu_mem_usage": True,
     }
     if controlnets:
         pipe_kwargs["controlnet"] = controlnets if len(controlnets) > 1 else controlnets[0]
 
     pipe = PipelineClass.from_pretrained(cfg.base_model, **pipe_kwargs)
+    pipe.to(device)  # move SDXL weights to GPU before loading the adapter on top
     pipe.init_custom_adapter(num_views=len(VIEWS))
     pipe.load_custom_adapter(cfg.adapter_repo, weight_name=cfg.adapter_weight)
     pipe.enable_vae_slicing()
-    pipe.to(device)
 
     if hasattr(pipe, "cond_encoder"):
         pipe.cond_encoder.to(device=device, dtype=torch.float16)

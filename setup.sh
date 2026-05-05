@@ -280,18 +280,20 @@ if run_from 6; then
         "${THIRD_PARTY_DIR}/MV-Adapter" \
         "MV-Adapter (canonical_multiview stage)"
 
-    # Install MV-Adapter as an editable Python package so `import mvadapter` works.
-    # Its requirements.txt pulls in diffusers/transformers/accelerate (already present
-    # from requirements.txt) so this is mostly a no-op on top of the existing env.
+    # Install MV-Adapter and its Python dependencies.
+    # requirements.txt contains nvdiffrast which is a CUDA extension needing
+    # --no-build-isolation; we filter it out here and build it in Step 7 instead.
     MV_ADAPTER_DIR="${THIRD_PARTY_DIR}/MV-Adapter"
     if [[ -d "${MV_ADAPTER_DIR}" ]]; then
+        if [[ -f "${MV_ADAPTER_DIR}/requirements.txt" ]]; then
+            info "Installing MV-Adapter Python dependencies (excluding nvdiffrast)..."
+            grep -v "nvdiffrast" "${MV_ADAPTER_DIR}/requirements.txt" \
+                | pip install -r /dev/stdin --quiet
+        fi
         if python -c "import mvadapter" 2>/dev/null; then
-            success "mvadapter already importable — skipping install"
+            success "mvadapter already importable — skipping editable install"
         else
-            info "Installing MV-Adapter Python package..."
-            if [[ -f "${MV_ADAPTER_DIR}/requirements.txt" ]]; then
-                pip install -r "${MV_ADAPTER_DIR}/requirements.txt" --quiet
-            fi
+            info "Installing MV-Adapter as editable package..."
             pip install -e "${MV_ADAPTER_DIR}" --quiet
             success "mvadapter installed"
         fi
@@ -310,6 +312,15 @@ if run_from 7; then
         warn "Install CUDA 12.4 toolkit and re-run: bash setup.sh --continue 7"
     else
         export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+
+        # nvdiffrast — required by MV-Adapter for mesh rasterization
+        if python -c "import nvdiffrast" 2>/dev/null; then
+            success "nvdiffrast already installed"
+        else
+            info "Building nvdiffrast (MV-Adapter dependency)..."
+            pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast.git"
+            success "nvdiffrast built"
+        fi
 
         RASTERIZER_DIR="${THIRD_PARTY_DIR}/Hunyuan3D-2.1/hy3dpaint/custom_rasterizer"
         if [[ -d "${RASTERIZER_DIR}" ]]; then
@@ -387,6 +398,11 @@ if run_from 9; then
     fi
 
     if [[ "$(uname -s)" == "Linux" ]]; then
+        if python -c "import nvdiffrast" 2>/dev/null; then
+            success "nvdiffrast importable (MV-Adapter mesh rasterization ready)"
+        else
+            warn "nvdiffrast not importable — run Step 7 on a GPU machine to build it"
+        fi
         if python -c "import custom_rasterizer_kernel" 2>/dev/null; then
             success "custom_rasterizer_kernel compiled"
         else
