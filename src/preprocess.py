@@ -80,6 +80,9 @@ def scan_multiview_folder(folder: Path | str) -> dict[str, Path]:
 
     found: dict[str, Path] = {}
     for path in sorted(folder.iterdir()):
+        # Skip hidden files and macOS resource-fork companions (._filename).
+        if path.name.startswith("."):
+            continue
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
         stem = path.stem.lower()

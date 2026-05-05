@@ -16,7 +16,7 @@ todos:
     status: completed
   - id: phase5-bake-export-cli
     content: "Phase 5: Create bake_texture.py, inpaint_texture.py, export_glb.py, and main.py CLI"
-    status: pending
+    status: completed
 isProject: false
 ---
 
