@@ -329,7 +329,7 @@ def generate_canonical_views(
     clean_rgba: Image.Image,
     cfg: "CanonicalMultiviewConfig",
     save_dir: Optional[Path] = None,
-) -> dict[str, Image.Image]:
+) -> tuple[dict[str, Image.Image], dict[str, Image.Image]]:
     """
     Generate canonical ``front/right/back/left`` views from a single clean RGBA.
 
@@ -343,8 +343,12 @@ def generate_canonical_views(
         save_dir:   Optional directory to save intermediate and output images.
 
     Returns:
-        Dict ``{"front": PIL.Image, "right": PIL.Image, "back": PIL.Image, "left": PIL.Image}``
-        where each value is an RGBA image (opaque, full-alpha).
+        A 2-tuple ``(canonical, controls)`` where:
+        - ``canonical`` is ``{"front": PIL.Image, "right": PIL.Image,
+          "back": PIL.Image, "left": PIL.Image}`` — opaque RGBA outputs.
+        - ``controls`` is a dict of the structural conditioning images that
+          were actually built, keyed by ``"depth"`` and/or ``"canny"``.
+          Empty when both ``cfg.use_depth`` and ``cfg.use_canny`` are False.
 
     Raises:
         ImportError: If MV-Adapter or diffusers is not installed.
@@ -448,8 +452,15 @@ def generate_canonical_views(
         _save_grid(canonical, save_dir / "grid.png")
         _save_manifest(canonical, cfg, save_dir)
 
+    # Collect control images that were actually built
+    controls: dict[str, Image.Image] = {}
+    if depth_img is not None:
+        controls["depth"] = depth_img
+    if canny_img is not None:
+        controls["canny"] = canny_img
+
     logger.info("Canonical views generated: %s", list(canonical.keys()))
-    return canonical
+    return canonical, controls
 
 
 # ---------------------------------------------------------------------------

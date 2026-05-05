@@ -498,7 +498,7 @@ def _stage_canonical_multiview(
         raise RuntimeError("No 'front' view found in rgba_views.")
 
     with log.step("generate_canonical_views"):
-        canonical_views = generate_canonical_views(
+        canonical_views, controls = generate_canonical_views(
             front_rgba, cfg.canonical, save_dir=save_dir
         )
 
@@ -514,8 +514,9 @@ def _stage_canonical_multiview(
     log.metric("gen_size", f"{cfg.canonical.gen_size}px")
     log.metric("steps",    str(cfg.canonical.steps))
 
+    n_cols = state["n_views"]
     view_b64s = [_pil_to_b64(canonical_views[k]) for k in ["front", "right", "back", "left"]]
-    return {
+    row_canonical = {
         "stage":   STAGE_LABELS["canonical_multiview"],
         "type":    "images",
         "views":   view_b64s,
@@ -523,7 +524,21 @@ def _stage_canonical_multiview(
             "gen_size": f"{cfg.canonical.gen_size}px",
             "steps":    str(cfg.canonical.steps),
         },
-    }, None
+    }
+
+    if controls:
+        ctrl_b64s = [_pil_to_b64(controls[k]) for k in ["depth", "canny"] if k in controls]
+        while len(ctrl_b64s) < n_cols:
+            ctrl_b64s.append(None)
+        row_controls = {
+            "stage":   "↳ controls",
+            "type":    "images",
+            "views":   ctrl_b64s,
+            "metrics": {k: "on" for k in controls},
+        }
+        return [row_canonical, row_controls], None
+
+    return row_canonical, None
 
 
 def _stage_preprocess(
