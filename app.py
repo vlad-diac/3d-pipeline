@@ -195,6 +195,11 @@ _CSS = """
 .pp-spin      { color: #f9e2af; }
 .pp-ok        { color: #a6e3a1; }
 .pp-fail      { color: #f38ba8; }
+.pp-cost      { font-size: 12px; line-height: 1.7; }
+.pp-cost-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 20px; }
+.pp-cost-item { }
+.pp-cost-item .cost-label { color: #9399b2; font-size: 11px; }
+.pp-cost-item .cost-value { color: #cdd6f4; font-weight: bold; }
 </style>
 """
 
@@ -301,6 +306,22 @@ def build_table_html(rows: list[dict], n_views: int) -> str:
                 f"<tr>{stage_td}"
                 f"{_span_cell(fail, n_views)}"
                 f"{metrics_td}</tr>"
+            )
+
+        elif rtype == "cost":
+            cost = row.get("cost", {})
+            items_html = "".join(
+                f'<div class="pp-cost-item">'
+                f'<div class="cost-label">{k}</div>'
+                f'<div class="cost-value">{v}</div>'
+                f'</div>'
+                for k, v in cost.items()
+            )
+            cost_html = f'<div class="pp-cost"><div class="pp-cost-grid">{items_html}</div></div>'
+            body_rows.append(
+                f"<tr>{stage_td}"
+                f'{_span_cell(cost_html, n_views + 1)}'
+                f"</tr>"
             )
 
     body = "\n".join(body_rows)
@@ -871,6 +892,7 @@ def run_pipeline(
     }
 
     # ---- Run selected stages in order ---------------------------------------
+    _pipeline_t0 = time.perf_counter()
     for stage_id in STAGE_IDS:
         if stage_id not in selected_stages:
             continue
@@ -919,6 +941,35 @@ def run_pipeline(
         yield build_table_html(rows, n_views), latest_mesh
 
     log.save()
+
+    # ---- RunPod cost summary row ----------------------------------------
+    try:
+        from src.cost import cost_summary_from_steps
+
+        pipeline_elapsed_s = time.perf_counter() - _pipeline_t0
+        cost = cost_summary_from_steps(
+            steps=log._steps,
+            total_s=pipeline_elapsed_s,
+        )
+        cost_display = {
+            "GPU":                    cost["gpu_label"],
+            "Run cost (flex)":        f"${cost['run_cost_flex']:.4f}",
+            "Run cost (active)":      f"${cost['run_cost_active']:.4f}",
+            "Monthly always-live":    f"${cost['monthly_always_live']:.2f}/mo",
+            f"Monthly on-demand ({cost['monthly_on_demand_runs']} runs)":
+                                      f"${cost['monthly_on_demand']:.2f}/mo",
+            "Cold start assumed":     f"{cost['cold_start_s']:.0f} s",
+            "Model load (measured)":  f"{cost['model_load_s']:.1f} s",
+            "Execution (measured)":   f"{cost['execution_s']:.1f} s",
+        }
+        rows.append({
+            "stage": "Cost Summary",
+            "type":  "cost",
+            "cost":  cost_display,
+        })
+        yield build_table_html(rows, n_views), latest_mesh
+    except Exception:
+        pass  # never block the UI on cost errors
 
 
 # ─── Gradio layout ────────────────────────────────────────────────────────────

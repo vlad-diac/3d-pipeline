@@ -223,6 +223,17 @@ class RunLogger:
             "metrics_full": self._metrics,
         }
 
+        # ---- RunPod cost estimate (only when running on RunPod) -----------
+        try:
+            from src.cost import cost_summary_from_steps, is_on_runpod
+            if is_on_runpod():
+                data["cost"] = cost_summary_from_steps(
+                    steps=self._steps,
+                    total_s=total_s,
+                )
+        except Exception as _cost_err:
+            pass  # never block metrics saving on cost errors
+
         # ---- JSON ----------------------------------------------------------
         json_path = self.output_dir / "metrics.json"
         json_path.write_text(json.dumps(data, indent=2))
