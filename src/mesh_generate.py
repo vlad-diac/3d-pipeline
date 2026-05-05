@@ -32,9 +32,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Imported lazily at call-time to avoid circular imports at module level;
-# referenced here so the dependency is obvious.
-# from src.preprocess import VIEW_ORDER
 
 
 # ---------------------------------------------------------------------------
@@ -175,15 +172,15 @@ def generate_mesh(pipeline, views: dict, cfg):
         image_input = list(views.values())[0]
         logger.info("Generating mesh from single view (seed=%d, steps=%d).", seed, cfg.shape_steps)
     else:
-        # The 2mv pipeline expects an ordered list [front, left, right, back],
-        # not a keyed dict. Import VIEW_ORDER here to avoid a circular import
-        # at module level (preprocess imports nothing from mesh_generate).
-        from src.preprocess import VIEW_ORDER  # type: ignore[import]
-        image_input = [views[k] for k in VIEW_ORDER if k in views]
+        # MVImageProcessorV2 (hy3dgen/shapegen/preprocessors.py) expects a dict
+        # keyed by orientation name {"front", "left", "right", "back"}.
+        # It uses view2idx = {'front':0,'left':1,'back':2,'right':3} to sort
+        # internally, so ordering in the dict does not matter — just the keys.
+        image_input = views
         logger.info(
             "Generating mesh from %d views %s (seed=%d, steps=%d).",
-            len(image_input),
-            [k for k in VIEW_ORDER if k in views],
+            len(views),
+            list(views.keys()),
             seed,
             cfg.shape_steps,
         )
