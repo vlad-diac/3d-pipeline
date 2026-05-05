@@ -8,16 +8,16 @@
 #   bash setup.sh --continue 4 --yes
 #
 # Steps:
-#   0  Pre-flight resource check + summary
-#   1  System dependencies (Linux only)
-#   2  Install Miniconda into ./conda/
-#   3  Create conda env  hy3d-mv  with Python 3.10
-#   4  Install PyTorch (CUDA 12.4 on Linux, CPU on macOS)
-#   5  Install Python dependencies from requirements.txt
-#   6  Clone third-party repositories into third_party/
-#   7  Build CUDA extensions (Linux/GPU only; skipped on macOS)
-#   8  Download model weights via scripts/download_models.py
-#   9  Verification checks
+#   0  preflight     Pre-flight resource check + summary
+#   1  system-deps   System dependencies (Linux only)
+#   2  miniconda     Install Miniconda into ./conda/
+#   3  conda-env     Create conda env  hy3d-mv  with Python 3.10
+#   4  pytorch       Install PyTorch (CUDA 12.4 on Linux, CPU on macOS)
+#   5  pip-deps      Install Python dependencies from requirements.txt
+#   6  clone-repos   Clone third-party repositories into third_party/
+#   7  cuda-ext      Build CUDA extensions (Linux/GPU only; skipped on macOS)
+#   8  models        Download model weights via scripts/download_models.py
+#   9  verify        Verification checks
 
 set -e
 
