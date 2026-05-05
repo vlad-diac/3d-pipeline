@@ -516,8 +516,14 @@ def _stage_canonical_multiview(
     log.metric("gen_size", f"{cfg.canonical.gen_size}px")
     log.metric("steps",    str(cfg.canonical.steps))
 
+    # Column order matches the table headers produced by build_table_html:
+    # "Front", "Left", "Right", "Back" (n_views=4).
+    # All rows use this same order so each depth/canny map sits directly below
+    # the canonical view it was used to condition.
+    TABLE_COL_ORDER = ["front", "left", "right", "back"]
     n_cols = state["n_views"]
-    view_b64s = [_pil_to_b64(canonical_views[k]) for k in ["front", "right", "back", "left"]]
+
+    view_b64s = [_pil_to_b64(canonical_views[k]) for k in TABLE_COL_ORDER]
     row_canonical = {
         "stage":   STAGE_LABELS["canonical_multiview"],
         "type":    "images",
@@ -530,11 +536,13 @@ def _stage_canonical_multiview(
 
     rows: list[dict] = [row_canonical]
 
-    # One sub-row per control type, each showing all 4 per-view maps as columns.
-    for ctrl_name, maps_list in controls.items():
-        ctrl_b64s = [_pil_to_b64(img) for img in maps_list]
-        while len(ctrl_b64s) < n_cols:
-            ctrl_b64s.append(None)
+    # One sub-row per control type.  Controls are keyed by view name so we can
+    # look up each map using TABLE_COL_ORDER to guarantee column alignment.
+    for ctrl_name, view_maps in controls.items():
+        ctrl_b64s = [
+            _pil_to_b64(view_maps[k]) if k in view_maps else None
+            for k in TABLE_COL_ORDER
+        ]
         rows.append({
             "stage":   f"↳ {ctrl_name}",
             "type":    "images",
