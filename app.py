@@ -322,39 +322,124 @@ def _stage_preprocess(
     save_dir: Path,
     cfg,
     log,
-) -> tuple[dict, Optional[Path]]:
-    from src.preprocess import collect_views, preprocess_all_views
+) -> tuple[list[dict], Optional[Path]]:
+    from src.preprocess import collect_views, preprocess_all_views, compose_over_gray
 
     view_paths: dict[str, Path] = state["view_paths"]
+    view_keys  = list(view_paths.keys())
+    n_cols     = state["n_views"]
+
+    remove_bg      = state.get("remove_bg", True)
+    center_subject = state.get("center_subject", True)
+    target_size    = state.get("preprocess_target_size")
 
     with log.step("collect_views"):
         raw_views = collect_views(**{k: str(v) for k, v in view_paths.items()})
 
     with log.step("preprocess_all_views"):
-        processed = preprocess_all_views(raw_views, remove_bg=False)
+        processed = preprocess_all_views(
+            raw_views,
+            remove_bg=remove_bg,
+            center_subject=center_subject,
+            target_size=target_size,
+        )
 
-    view_b64s: list[Optional[str]] = []
-    for orient in list(view_paths.keys()):
-        entry = processed.get(orient)
-        if entry:
-            img = entry["shape"]
-            img.save(str(save_dir / f"shape_{orient}.png"))
-            view_b64s.append(_pil_to_b64(img))
-        else:
-            view_b64s.append(None)
-
+    # Persist into pipeline state for downstream stages.
     state["processed"]   = processed
     state["raw_views"]   = raw_views
     state["shape_views"] = {k: v["shape"] for k, v in processed.items()}
     state["paint_views"] = {k: v["paint"] for k, v in processed.items()}
-
     log.metric("views_preprocessed", len(processed))
-    return {
-        "stage": STAGE_LABELS["preprocess"],
-        "type": "images",
-        "views": view_b64s,
-        "metrics": {"views": str(len(processed))},
-    }, None
+
+    def _row_b64s(key: str) -> list[Optional[str]]:
+        """Extract base64 thumbnails for a given intermediate key across all views."""
+        b64s: list[Optional[str]] = []
+        for orient in view_keys:
+            entry = processed.get(orient)
+            if entry and key in entry:
+                b64s.append(_pil_to_b64(entry[key]))
+            else:
+                b64s.append(None)
+        while len(b64s) < n_cols:
+            b64s.append(None)
+        return b64s[:n_cols]
+
+    def _row_b64s_rgba_on_gray(key: str) -> list[Optional[str]]:
+        """Like _row_b64s but composites the RGBA intermediate over gray for display."""
+        b64s: list[Optional[str]] = []
+        for orient in view_keys:
+            entry = processed.get(orient)
+            if entry and key in entry:
+                img = entry[key]
+                display_img = compose_over_gray(img) if img.mode == "RGBA" else img
+                b64s.append(_pil_to_b64(display_img))
+            else:
+                b64s.append(None)
+        while len(b64s) < n_cols:
+            b64s.append(None)
+        return b64s[:n_cols]
+
+    # Save all intermediates to disk.
+    for orient in view_keys:
+        entry = processed.get(orient, {})
+        for key, img in entry.items():
+            fname = save_dir / f"{key}_{orient}.png"
+            img.save(str(fname))
+
+    rows: list[dict] = []
+
+    # Row: raw input (already in state as input row, but useful in context).
+    rows.append({
+        "stage":   "Pre: Raw",
+        "type":    "images",
+        "views":   _row_b64s_rgba_on_gray("raw"),
+        "metrics": {"step": "loaded RGBA"},
+    })
+
+    # Row: after background removal (only if remove_bg was enabled).
+    if remove_bg:
+        rows.append({
+            "stage":   "Pre: Rembg",
+            "type":    "images",
+            "views":   _row_b64s_rgba_on_gray("rgba"),
+            "metrics": {"step": "background removed"},
+        })
+
+    # Row: after center+pad (only if enabled).
+    if center_subject:
+        rows.append({
+            "stage":   "Pre: Center+Pad",
+            "type":    "images",
+            "views":   _row_b64s_rgba_on_gray("centered"),
+            "metrics": {"step": "centered & padded"},
+        })
+
+    # Row: after resize (only if a target size was set).
+    if target_size is not None:
+        rows.append({
+            "stage":   f"Pre: Resize→{target_size}",
+            "type":    "images",
+            "views":   _row_b64s_rgba_on_gray("resized"),
+            "metrics": {"step": f"→ {target_size}×{target_size} px"},
+        })
+
+    # Row: paint reference (gray composite — what the paint model sees).
+    rows.append({
+        "stage":   "Pre: Paint ref",
+        "type":    "images",
+        "views":   _row_b64s("paint"),
+        "metrics": {"step": "gray composite (paint)"},
+    })
+
+    # Row: shape reference (white composite — what the shape DiT sees).
+    rows.append({
+        "stage":   "Pre: Shape ref",
+        "type":    "images",
+        "views":   _row_b64s("shape"),
+        "metrics": {"step": "white composite (shape)"},
+    })
+
+    return rows, None
 
 
 def _stage_mesh_generate(
@@ -712,6 +797,9 @@ def run_pipeline(
     input_folder: str,
     selected_stages: list[str],
     output_format: str = "glb",
+    remove_bg: bool = True,
+    center_subject: bool = True,
+    preprocess_target_size: Optional[int] = None,
 ):
     """
     Gradio generator: yields (html_table, mesh_path_or_None) after each stage.
@@ -775,10 +863,13 @@ def run_pipeline(
 
     # ---- Pipeline state accumulated across stages ---------------------------
     state: dict = {
-        "view_paths":     view_paths,
-        "mode":           mode,
-        "n_views":        n_views,
-        "output_format":  output_format,
+        "view_paths":              view_paths,
+        "mode":                    mode,
+        "n_views":                 n_views,
+        "output_format":           output_format,
+        "remove_bg":               remove_bg,
+        "center_subject":          center_subject,
+        "preprocess_target_size":  preprocess_target_size,
     }
 
     # ---- Run selected stages in order ---------------------------------------
@@ -804,8 +895,15 @@ def run_pipeline(
             runner = _RUNNERS[stage_id]
             row_data, new_mesh = runner(state, stage_dir, cfg, log)
             elapsed = time.perf_counter() - t0
-            row_data.setdefault("metrics", {})["elapsed"] = f"{elapsed:.1f} s"
-            rows[-1] = row_data
+            if isinstance(row_data, list):
+                # Runner returned multiple sub-step rows (e.g. preprocess).
+                # Stamp elapsed time on the last row and replace the placeholder.
+                if row_data:
+                    row_data[-1].setdefault("metrics", {})["elapsed"] = f"{elapsed:.1f} s"
+                rows[-1:] = row_data
+            else:
+                row_data.setdefault("metrics", {})["elapsed"] = f"{elapsed:.1f} s"
+                rows[-1] = row_data
             if new_mesh and Path(new_mesh).exists():
                 latest_mesh = str(new_mesh)
         except Exception as exc:
@@ -864,6 +962,37 @@ def _build_ui() -> gr.Blocks:
                      "GPU-required stages will be skipped automatically on CPU.",
             )
 
+            with gr.Accordion("Preprocessing Options", open=False):
+                gr.Markdown(
+                    "Controls applied during the **Preprocess** stage. "
+                    "Each enabled step is shown as a separate row in the results table."
+                )
+                with gr.Row():
+                    remove_bg_chk = gr.Checkbox(
+                        label="Remove background (rembg)",
+                        value=True,
+                        info="Strip the background using rembg (hy3dshape or standard library fallback).",
+                    )
+                    center_subject_chk = gr.Checkbox(
+                        label="Center and pad subject",
+                        value=True,
+                        info="Crop to subject bounding box, extend to square, add 10% margin.",
+                    )
+                with gr.Row():
+                    resize_chk = gr.Checkbox(
+                        label="Resize to canonical size",
+                        value=False,
+                        info="Resize to the target size after centering (518 px = DINOv2-Giant encoder).",
+                    )
+                    resize_size_num = gr.Number(
+                        label="Target size (px)",
+                        value=518,
+                        minimum=64,
+                        maximum=2048,
+                        step=1,
+                        info="Only used when 'Resize to canonical size' is checked.",
+                    )
+
             with gr.Row():
                 output_format_dropdown = gr.Dropdown(
                     choices=[("GLB — binary glTF with PBR materials", "glb"),
@@ -899,9 +1028,39 @@ def _build_ui() -> gr.Blocks:
             outputs=[scan_info],
         )
 
+        def _run_pipeline_ui(
+            test_name,
+            input_folder,
+            selected_stages,
+            output_format,
+            remove_bg,
+            center_subject,
+            resize_enabled,
+            resize_size,
+        ):
+            target_size = int(resize_size) if resize_enabled else None
+            yield from run_pipeline(
+                test_name=test_name,
+                input_folder=input_folder,
+                selected_stages=selected_stages,
+                output_format=output_format,
+                remove_bg=remove_bg,
+                center_subject=center_subject,
+                preprocess_target_size=target_size,
+            )
+
         run_btn.click(
-            fn=run_pipeline,
-            inputs=[test_name_box, input_folder_box, stage_checkboxes, output_format_dropdown],
+            fn=_run_pipeline_ui,
+            inputs=[
+                test_name_box,
+                input_folder_box,
+                stage_checkboxes,
+                output_format_dropdown,
+                remove_bg_chk,
+                center_subject_chk,
+                resize_chk,
+                resize_size_num,
+            ],
             outputs=[results_html, model3d_viewer],
         )
 

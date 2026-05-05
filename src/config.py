@@ -122,6 +122,18 @@ class PipelineConfig:
     # leave at 0 for clean CG renders where rembg already gives sharp edges.
     rembg_erode_px: int = 0
 
+    # ---------------------------------------------------- subject centering
+    # When True, crop to subject bounding box, extend to square, add margin.
+    # Ensures consistent framing for the shape model's DINOv2 image encoder.
+    preprocess_center_subject: bool = True
+
+    # ------------------------------------------------ canonical resize
+    # Resize the RGBA subject to this square side length after centering.
+    # 518 px matches the DINOv2-Giant encoder expectation documented in the
+    # ComfyUI pipeline ("tied to the image encoder").
+    # None = no resize (keep size produced by center_and_pad).
+    preprocess_target_size: int | None = None
+
     # ---------------------------------------------------------- reproducibility
     seed: int = 42
 
