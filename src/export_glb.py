@@ -113,8 +113,12 @@ def export_textured_mesh(
     pipeline.render.set_texture(refined_albedo, force_set=True)
     pipeline.render.set_texture_mr(refined_mr)
 
+    # Save OBJ + textures ourselves — MeshRender.save_mesh() calls save_mesh()
+    # from mesh_utils.py which imports bpy at the module level and therefore
+    # cannot be imported outside a Blender environment.  We replicate the
+    # relevant logic here using only numpy / cv2.
     logger.info("Saving OBJ + textures to %s ...", output_obj)
-    pipeline.render.save_mesh(str(output_obj), downsample=False)
+    _save_renderer_mesh_to_obj(pipeline.render, output_obj, stem)
 
     if output_format == "obj":
         logger.info("OBJ export complete: %s", output_obj)
@@ -144,6 +148,82 @@ def export_textured_mesh(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _save_renderer_mesh_to_obj(render, output_obj: Path, stem: str) -> None:
+    """
+    Write OBJ + MTL + JPEG texture files from a MeshRender instance.
+
+    Replicates mesh_utils.save_obj_mesh() without the top-level ``import bpy``
+    that makes that module unimportable outside a Blender environment.
+
+    The files written alongside the OBJ are:
+      <stem>.mtl            — material definition
+      <stem>.jpg            — albedo (diffuse) map
+      <stem>_metallic.jpg   — metallic channel (greyscale)
+      <stem>_roughness.jpg  — roughness channel (greyscale)
+    """
+    import cv2
+    import numpy as np
+    from io import StringIO
+
+    output_dir = output_obj.parent
+    base_path = str(output_dir / stem)
+
+    # ── 1. Mesh geometry ──────────────────────────────────────────────────
+    vtx_pos, pos_idx, vtx_uv, uv_idx = render.get_mesh(normalize=False)
+    vtx_pos = np.array(vtx_pos, dtype=np.float32)
+    vtx_uv  = np.array(vtx_uv,  dtype=np.float32)
+    pos_idx = np.array(pos_idx, dtype=np.int32)
+    uv_idx  = np.array(uv_idx,  dtype=np.int32)
+
+    # ── 2. OBJ content ────────────────────────────────────────────────────
+    buf = StringIO()
+    buf.write(f"mtllib {stem}.mtl\no {stem}\n")
+    np.savetxt(buf, vtx_pos, fmt="v %.6f %.6f %.6f")
+    np.savetxt(buf, vtx_uv,  fmt="vt %.6f %.6f")
+    buf.write("s 0\nusemtl Material\n")
+
+    pos_idx1 = pos_idx + 1
+    uv_idx1  = uv_idx  + 1
+    fmt_face = np.frompyfunc(lambda p, u: f"{int(p)}/{int(u)}", 2, 1)
+    face_strs = [f"f {' '.join(row)}" for row in fmt_face(pos_idx1, uv_idx1)]
+    buf.write("\n".join(face_strs) + "\n")
+    output_obj.write_text(buf.getvalue())
+
+    # ── 3. Textures ───────────────────────────────────────────────────────
+    def _save_tex(arr: np.ndarray, suffix: str = "", greyscale: bool = False) -> str:
+        path = f"{base_path}{suffix}.jpg"
+        img_u8 = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+        if greyscale:
+            img_u8 = cv2.cvtColor(img_u8, cv2.COLOR_RGB2GRAY)
+            cv2.imwrite(path, img_u8)
+        else:
+            cv2.imwrite(path, img_u8[..., ::-1])  # RGB → BGR for cv2
+        return path
+
+    albedo = render.get_texture()
+    _save_tex(albedo)
+
+    metallic, roughness = render.get_texture_mr()
+    has_mr = metallic is not None and roughness is not None
+    if has_mr:
+        _save_tex(metallic,  "_metallic",  greyscale=True)
+        _save_tex(roughness, "_roughness", greyscale=True)
+
+    # ── 4. MTL file ───────────────────────────────────────────────────────
+    mtl_path = f"{base_path}.mtl"
+    with open(mtl_path, "w") as f:
+        f.write("newmtl Material\n")
+        f.write(f"Kd 0.800 0.800 0.800\n")
+        f.write(f"Ke 0.000 0.000 0.000\n")
+        f.write(f"Ni 1.500\n")
+        f.write(f"d 1.0\n")
+        f.write(f"illum {'2' if has_mr else '3'}\n")
+        f.write(f"map_Kd {stem}.jpg\n")
+        if has_mr:
+            f.write(f"map_Pm {stem}_metallic.jpg\n")
+            f.write(f"map_Pr {stem}_roughness.jpg\n")
+
 
 def _cleanup_obj_files(
     output_obj: Path,
