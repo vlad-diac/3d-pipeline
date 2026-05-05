@@ -1173,6 +1173,188 @@ def run_pipeline(
         pass  # never block the UI on cost errors
 
 
+# ─── Load-run helpers ─────────────────────────────────────────────────────────
+
+def _list_runs() -> list[tuple[str, str]]:
+    """Scan outputs/test/ and return sorted (label, abs_path) pairs, newest first."""
+    root = _PROJECT_ROOT / "outputs" / "test"
+    if not root.exists():
+        return []
+    choices: list[tuple[str, str]] = []
+    for test_dir in sorted(root.iterdir()):
+        if not test_dir.is_dir():
+            continue
+        for ts_dir in sorted(test_dir.iterdir(), reverse=True):
+            if ts_dir.is_dir():
+                label = f"{test_dir.name}  /  {ts_dir.name}"
+                choices.append((label, str(ts_dir)))
+    return choices
+
+
+def _detect_n_views(stage_dirs: list[Path]) -> int:
+    """Infer view count from orientation-named PNG files in stage dirs."""
+    found: set[str] = set()
+    for d in stage_dirs:
+        for f in d.glob("*.png"):
+            stem = f.stem.lower()
+            for v in ("front", "left", "right", "back"):
+                if stem.endswith(f"_{v}"):
+                    found.add(v)
+    return len(found) if found else 1
+
+
+def _load_view_images(
+    stage_dir: Path, view_keys: list[str], prefixes: list[str]
+) -> list[Optional[str]]:
+    """
+    Load per-view images from stage_dir, trying each prefix in order.
+    Falls back to any file ending in ``_{view}.png``.
+    Returns a list of base64 data-URIs (or None) aligned to view_keys.
+    """
+    result: list[Optional[str]] = []
+    for view in view_keys:
+        b64 = None
+        for prefix in prefixes:
+            candidate = stage_dir / f"{prefix}_{view}.png"
+            if candidate.exists():
+                b64 = _path_to_b64(candidate)
+                break
+        if b64 is None:
+            candidates = sorted(stage_dir.glob(f"*_{view}.png"))
+            if candidates:
+                b64 = _path_to_b64(candidates[0])
+        result.append(b64)
+    return result
+
+
+def load_run(run_path_str: str) -> tuple[str, Optional[str]]:
+    """
+    Reconstruct the results table from a saved run directory.
+    Returns (html_table, glb_path_or_None) — same signature as run_pipeline yields.
+    """
+    if not run_path_str:
+        return "<p style='color:#f38ba8'>⚠ No run selected.</p>", None
+
+    run_dir = Path(run_path_str)
+    if not run_dir.is_dir():
+        return f"<p style='color:#f38ba8'>⚠ Directory not found: {run_path_str}</p>", None
+
+    # Read metrics.json for run-level info
+    import json as _json
+    metrics_data: dict = {}
+    metrics_path = run_dir / "metrics.json"
+    if metrics_path.exists():
+        try:
+            metrics_data = _json.loads(metrics_path.read_text())
+        except Exception:
+            pass
+
+    # Discover numbered stage dirs  (e.g. 01_preprocess, 02_mesh_generate)
+    stage_dirs: list[Path] = sorted(
+        d for d in run_dir.iterdir()
+        if d.is_dir() and len(d.name) > 2 and d.name[:2].isdigit()
+    )
+
+    _VIEW_KEYS = ["front", "left", "right", "back"]
+    n_views = _detect_n_views(stage_dirs)
+    view_keys = _VIEW_KEYS[:n_views] if n_views <= 4 else _VIEW_KEYS
+
+    # ── Input row: pull raw images from first stage dir ───────────────────────
+    input_b64s: list[Optional[str]] = []
+    if stage_dirs:
+        input_b64s = _load_view_images(stage_dirs[0], view_keys, ["raw"])
+    if not any(input_b64s):
+        input_b64s = [None] * n_views
+
+    run_meta: dict[str, str] = {}
+    if metrics_data:
+        run_meta["phase"] = metrics_data.get("phase", "")
+        ts = metrics_data.get("timestamp", "")
+        if ts:
+            run_meta["timestamp"] = ts[:19].replace("T", " ")
+        total_s = metrics_data.get("total_elapsed_s")
+        if total_s is not None:
+            run_meta["total"] = f"{total_s:.1f} s"
+    run_meta["output"] = str(run_dir.relative_to(_PROJECT_ROOT))
+
+    rows: list[dict] = [{
+        "stage":   "Input",
+        "type":    "input",
+        "views":   input_b64s,
+        "metrics": run_meta,
+    }]
+
+    latest_glb: Optional[str] = None
+
+    for stage_dir in stage_dirs:
+        parts = stage_dir.name.split("_", 1)
+        if len(parts) < 2:
+            continue
+        stage_id = parts[1]
+        label = STAGE_LABELS.get(stage_id, stage_id.replace("_", " ").title())
+
+        glb_files = sorted(stage_dir.glob("*.glb"))
+        row: dict = {"stage": label, "metrics": {}}
+
+        if glb_files:
+            # Prefer output.glb > postprocessed > uv > first found
+            glb = glb_files[0]
+            for pref in ("output", "postprocessed", "uv"):
+                preferred = [g for g in glb_files if pref in g.stem.lower()]
+                if preferred:
+                    glb = preferred[0]
+                    break
+            row.update({"type": "mesh", "glb_path": glb})
+            latest_glb = str(glb)
+
+        elif stage_id == "bake_texture":
+            atlas_path = stage_dir / "baked_albedo.png"
+            row.update({
+                "type":  "atlas",
+                "atlas": _path_to_b64(atlas_path) if atlas_path.exists() else None,
+            })
+
+        elif stage_id == "inpaint_texture":
+            atlas_path = stage_dir / "refined_albedo.png"
+            row.update({
+                "type":  "atlas",
+                "atlas": _path_to_b64(atlas_path) if atlas_path.exists() else None,
+            })
+
+        elif stage_id == "paint_multiview":
+            candidates = sorted(stage_dir.glob("albedo_upscaled_*.png"))
+            atlas_path = candidates[0] if candidates else None
+            row.update({
+                "type":  "atlas",
+                "atlas": _path_to_b64(atlas_path) if atlas_path else None,
+            })
+
+        elif stage_id == "render_multiview":
+            normals = sorted(stage_dir.glob("normal_*.png"))[:n_views]
+            b64s: list[Optional[str]] = [_path_to_b64(p) for p in normals]
+            b64s += [None] * (n_views - len(b64s))
+            row.update({"type": "images", "views": b64s})
+
+        else:
+            # Image stages: prefer most-processed variant
+            b64s = _load_view_images(
+                stage_dir, view_keys, ["resized", "rgba", "centered", "raw"]
+            )
+            row.update({"type": "images", "views": b64s})
+
+        rows.append(row)
+
+    # Prefer the final export GLB for the 3-D viewer
+    for stage_dir in stage_dirs:
+        if "export_glb" in stage_dir.name:
+            candidate = stage_dir / "output.glb"
+            if candidate.exists():
+                latest_glb = str(candidate)
+            break
+
+    return build_table_html(rows, n_views), latest_glb
+
+
 # ─── Gradio layout ────────────────────────────────────────────────────────────
 
 def _build_ui() -> gr.Blocks:
@@ -1322,7 +1504,20 @@ def _build_ui() -> gr.Blocks:
                 )
                 run_btn = gr.Button("▶ Run Pipeline", variant="primary", scale=1)
 
-        # ── Section 3: Results ───────────────────────────────────────────────
+        # ── Section 3: Load Previous Run ─────────────────────────────────────
+        with gr.Group():
+            gr.Markdown("### Load Previous Run")
+            with gr.Row():
+                run_selector = gr.Dropdown(
+                    choices=_list_runs(),
+                    label="Select run",
+                    info="Runs from outputs/test/, newest first. Hit Refresh after new runs complete.",
+                    scale=4,
+                )
+                refresh_runs_btn = gr.Button("🔄 Refresh", scale=1)
+                load_run_btn = gr.Button("📂 Load Run", variant="secondary", scale=1)
+
+        # ── Section 4: Results ───────────────────────────────────────────────
         with gr.Group():
             gr.Markdown("### Results")
             with gr.Row():
@@ -1403,6 +1598,17 @@ def _build_ui() -> gr.Blocks:
                 canon_canny_scale_num,
                 canon_prompt_box,
             ],
+            outputs=[results_html, model3d_viewer],
+        )
+
+        refresh_runs_btn.click(
+            fn=lambda: gr.update(choices=_list_runs()),
+            outputs=[run_selector],
+        )
+
+        load_run_btn.click(
+            fn=load_run,
+            inputs=[run_selector],
             outputs=[results_html, model3d_viewer],
         )
 
