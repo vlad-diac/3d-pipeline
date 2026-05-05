@@ -473,12 +473,14 @@ def _stage_render_multiview(
     while len(view_b64s) < n_cols:
         view_b64s.append(None)
 
+    uv_glb_path = save_dir / "mesh_uv.glb"
+
     return {
         "stage":   STAGE_LABELS["render_multiview"],
         "type":    "images",
         "views":   view_b64s,
         "metrics": {"normal_maps": str(len(normal_maps))},
-    }, None
+    }, uv_glb_path
 
 
 def _stage_paint_multiview(
@@ -646,28 +648,30 @@ def _stage_export_glb(
 
     from src.export_glb import export_textured_mesh
 
-    glb_path = save_dir / "output.glb"
+    fmt = state.get("output_format", "glb")
+    out_path = save_dir / f"output.{fmt}"
     with log.step("export_textured_mesh"):
-        export_textured_mesh(
+        result_path = export_textured_mesh(
             state["paint_pipeline"],
             state["refined_albedo"],
             state["refined_mr"],
             state["uv_mesh"],
-            output_path=glb_path,
-            cleanup_obj=True,
+            output_path=out_path,
+            cleanup_obj=(fmt == "glb"),
+            output_format=fmt,
         )
 
-    size_mb = glb_path.stat().st_size / 1024 ** 2 if glb_path.exists() else 0
-    log.metric("glb_size_mb", f"{size_mb:.1f}")
+    size_mb = result_path.stat().st_size / 1024 ** 2 if result_path.exists() else 0
+    log.metric("output_size_mb", f"{size_mb:.1f}")
 
-    state["output_glb"] = glb_path
+    state["output_mesh"] = result_path
 
     return {
         "stage":    STAGE_LABELS["export_glb"],
         "type":     "mesh",
-        "glb_path": glb_path,
-        "metrics":  {"size": f"{size_mb:.1f} MB"},
-    }, glb_path
+        "glb_path": result_path,
+        "metrics":  {"format": fmt.upper(), "size": f"{size_mb:.1f} MB"},
+    }, result_path
 
 
 _RUNNERS = {
@@ -707,9 +711,10 @@ def run_pipeline(
     test_name: str,
     input_folder: str,
     selected_stages: list[str],
+    output_format: str = "glb",
 ):
     """
-    Gradio generator: yields (html_table, glb_path_or_None) after each stage.
+    Gradio generator: yields (html_table, mesh_path_or_None) after each stage.
     """
     # ---- Validation ---------------------------------------------------------
     test_name = (test_name or "test").strip().replace(" ", "_") or "test"
@@ -765,14 +770,15 @@ def run_pipeline(
         }
     ]
 
-    latest_glb: Optional[str] = None
-    yield build_table_html(rows, n_views), latest_glb
+    latest_mesh: Optional[str] = None
+    yield build_table_html(rows, n_views), latest_mesh
 
     # ---- Pipeline state accumulated across stages ---------------------------
     state: dict = {
-        "view_paths": view_paths,
-        "mode":       mode,
-        "n_views":    n_views,
+        "view_paths":     view_paths,
+        "mode":           mode,
+        "n_views":        n_views,
+        "output_format":  output_format,
     }
 
     # ---- Run selected stages in order ---------------------------------------
@@ -791,17 +797,17 @@ def run_pipeline(
             "running": True,
             "metrics": {},
         })
-        yield build_table_html(rows, n_views), latest_glb
+        yield build_table_html(rows, n_views), latest_mesh
 
         t0 = time.perf_counter()
         try:
             runner = _RUNNERS[stage_id]
-            row_data, new_glb = runner(state, stage_dir, cfg, log)
+            row_data, new_mesh = runner(state, stage_dir, cfg, log)
             elapsed = time.perf_counter() - t0
             row_data.setdefault("metrics", {})["elapsed"] = f"{elapsed:.1f} s"
             rows[-1] = row_data
-            if new_glb and Path(new_glb).exists():
-                latest_glb = str(new_glb)
+            if new_mesh and Path(new_mesh).exists():
+                latest_mesh = str(new_mesh)
         except Exception as exc:
             elapsed = time.perf_counter() - t0
             err_msg = f"{type(exc).__name__}: {exc}"
@@ -814,7 +820,7 @@ def run_pipeline(
                 "metrics": {"elapsed": f"{elapsed:.1f} s"},
             }
 
-        yield build_table_html(rows, n_views), latest_glb
+        yield build_table_html(rows, n_views), latest_mesh
 
     log.save()
 
@@ -858,18 +864,32 @@ def _build_ui() -> gr.Blocks:
                      "GPU-required stages will be skipped automatically on CPU.",
             )
 
-            run_btn = gr.Button("▶ Run Pipeline", variant="primary")
+            with gr.Row():
+                output_format_dropdown = gr.Dropdown(
+                    choices=[("GLB — binary glTF with PBR materials", "glb"),
+                             ("OBJ — Wavefront mesh + JPEG textures", "obj")],
+                    value="glb",
+                    label="Output format",
+                    info="Applies to the Export GLB stage.",
+                    scale=2,
+                )
+                run_btn = gr.Button("▶ Run Pipeline", variant="primary", scale=1)
 
         # ── Section 3: Results ───────────────────────────────────────────────
         with gr.Group():
             gr.Markdown("### Results")
+            with gr.Row():
+                model3d_viewer = gr.Model3D(
+                    label="3D Viewer — updates after each mesh stage",
+                    height=480,
+                    display_mode="solid",
+                    clear_color=(0.12, 0.12, 0.16, 1.0),
+                    camera_position=(None, None, None),
+                    zoom_speed=1.2,
+                    interactive=False,
+                )
             results_html = gr.HTML(
                 value="<p style='color:#585b70'>Results will appear here after running.</p>"
-            )
-            model3d_viewer = gr.Model3D(
-                label="Latest mesh output",
-                height=420,
-                clear_color=(0.1, 0.1, 0.1, 1.0),
             )
 
         # ── Events ───────────────────────────────────────────────────────────
@@ -881,7 +901,7 @@ def _build_ui() -> gr.Blocks:
 
         run_btn.click(
             fn=run_pipeline,
-            inputs=[test_name_box, input_folder_box, stage_checkboxes],
+            inputs=[test_name_box, input_folder_box, stage_checkboxes, output_format_dropdown],
             outputs=[results_html, model3d_viewer],
         )
 

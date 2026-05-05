@@ -54,9 +54,10 @@ def export_textured_mesh(
     output_path: "Path | str",
     *,
     cleanup_obj: bool = True,
+    output_format: str = "glb",
 ) -> Path:
     """
-    Apply textures to the mesh and export as a PBR GLB.
+    Apply textures to the mesh and export as GLB or OBJ.
 
     Args:
         pipeline:       Initialized PaintPipeline.  The mesh is (re)loaded into
@@ -67,30 +68,34 @@ def export_textured_mesh(
         mesh:           The UV-unwrapped trimesh.Trimesh used throughout the
                         pipeline.  Must be the same geometry instance as was
                         used during the bake stage.
-        output_path:    Desired output file path.  The .glb extension is always
-                        used for the final output regardless of the suffix
-                        provided.  The OBJ and JPEG intermediates are placed in
-                        the same directory with the same stem.
+        output_path:    Desired output file path.  The extension is overridden
+                        by ``output_format``.  OBJ and JPEG intermediates are
+                        placed in the same directory with the same stem.
         cleanup_obj:    If True (default), remove the intermediate OBJ and
                         JPEG texture files after GLB export succeeds.
+                        Ignored when output_format is "obj".
+        output_format:  "glb" (default) — convert to GLB with PBR materials.
+                        "obj" — keep the OBJ + JPEG texture sidecars as the
+                        final output (no GLB conversion step).
 
     Returns:
-        Path to the exported GLB file.
+        Path to the exported file (.glb or .obj).
 
     Raises:
-        ImportError:   If convert_utils is not importable (CUDA extensions not
-                       compiled — expected on macOS dev machines).
-        RuntimeError:  If GLB export fails for any other reason.
+        ImportError:   If convert_utils is not importable and format is "glb"
+                       (CUDA extensions not compiled — expected on macOS).
+        RuntimeError:  If export fails for any other reason.
+        ValueError:    If output_format is not "glb" or "obj".
     """
-    from convert_utils import create_glb_with_pbr_materials  # type: ignore[import]
+    if output_format not in ("glb", "obj"):
+        raise ValueError(f"output_format must be 'glb' or 'obj', got {output_format!r}")
 
-    output_path = Path(output_path).with_suffix(".glb")
+    output_path = Path(output_path).with_suffix(f".{output_format}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     stem = output_path.stem
     output_dir = output_path.parent
     output_obj = output_dir / f"{stem}.obj"
-    output_glb = output_path
 
     texture_paths = {
         "albedo":     str(output_dir / f"{stem}.jpg"),
@@ -98,7 +103,7 @@ def export_textured_mesh(
         "roughness":  str(output_dir / f"{stem}_roughness.jpg"),
     }
 
-    logger.info("Exporting textured mesh to %s ...", output_glb)
+    logger.info("Exporting textured mesh → %s (format=%s) ...", output_path, output_format)
 
     # (Re)load the mesh into the renderer so its internal UV state matches the
     # bake pass.  This is a lightweight operation — it just updates the GPU
@@ -111,6 +116,14 @@ def export_textured_mesh(
     logger.info("Saving OBJ + textures to %s ...", output_obj)
     pipeline.render.save_mesh(str(output_obj), downsample=False)
 
+    if output_format == "obj":
+        logger.info("OBJ export complete: %s", output_obj)
+        return output_obj
+
+    # GLB path: convert OBJ + textures to a self-contained binary glTF.
+    from convert_utils import create_glb_with_pbr_materials  # type: ignore[import]
+
+    output_glb = output_path
     logger.info("Converting OBJ to GLB with PBR materials ...")
     create_glb_with_pbr_materials(str(output_obj), texture_paths, str(output_glb))
 

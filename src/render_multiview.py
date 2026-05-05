@@ -165,13 +165,31 @@ class PaintPipeline:
         export — the renderer's internal state (UV buffer, vertex positions)
         must remain consistent across render → bake → export stages.
 
+        Calls MeshRender.set_mesh() directly with numpy arrays extracted from
+        the trimesh, bypassing MeshRender.load_mesh() which requires the bpy
+        mesh_utils helper (not available without Blender).
+
+        After xatlas UV unwrap, faces index both geometry and UV consistently,
+        so pos_idx == uv_idx.
+
         Args:
             mesh: UV-unwrapped trimesh.Trimesh with .visual.uv set.
         """
-        self.render.load_mesh(mesh=mesh)
+        import numpy as np
+
+        vtx_pos = np.array(mesh.vertices, dtype=np.float32)
+        pos_idx = np.array(mesh.faces,    dtype=np.int32)
+
+        vtx_uv: "np.ndarray | None" = None
+        uv_idx: "np.ndarray | None" = None
+        if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
+            vtx_uv = np.array(mesh.visual.uv, dtype=np.float32)
+            uv_idx = pos_idx.copy()
+
+        self.render.set_mesh(vtx_pos, pos_idx, vtx_uv=vtx_uv, uv_idx=uv_idx)
         logger.info(
-            "Mesh loaded into renderer: %d vertices, %d faces.",
-            len(mesh.vertices), len(mesh.faces),
+            "Mesh loaded into renderer: %d vertices, %d faces, UVs=%s.",
+            len(mesh.vertices), len(mesh.faces), vtx_uv is not None,
         )
 
 
