@@ -293,9 +293,12 @@ def load_mvadapter_pipe(cfg: "CanonicalMultiviewConfig", device: str):
     pipe.to(device)  # stream SDXL weights from meta tensors directly to GPU
     pipe.init_custom_adapter(num_views=len(VIEWS))
     pipe.load_custom_adapter(cfg.adapter_repo, weight_name=cfg.adapter_weight)
-    # Second sweep: init_custom_adapter / load_custom_adapter add new modules after
-    # the first pipe.to(device), which leaves them on CPU. This ensures every
-    # sub-module (including cond_encoder and adapter layers) is on the target device.
+    # diffusers pipeline.to() only casts registered components (unet, vae,
+    # text_encoder, …).  cond_encoder is added by init_custom_adapter as a plain
+    # Python attribute so it is skipped and stays float32.  Cast it explicitly.
+    if hasattr(pipe, "cond_encoder"):
+        pipe.cond_encoder.to(device=device, dtype=torch.float16)
+    # Sweep remaining pipeline components to make sure everything else is on device.
     pipe.to(device=device, dtype=torch.float16)
     pipe.enable_vae_slicing()
 
