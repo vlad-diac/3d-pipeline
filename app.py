@@ -464,19 +464,18 @@ def _stage_mesh_generate(
         log.metric("raw_vertices", len(raw_mesh.vertices), unit="verts")
         log.metric("raw_faces",    len(raw_mesh.faces),    unit="faces")
 
-    glb_path = save_dir / "mesh_raw.glb"
-    raw_mesh.export(str(glb_path))
+    mesh_path = state["mesh_saver"].save(raw_mesh, save_dir, "mesh_raw")
     state["raw_mesh"] = raw_mesh
 
     return {
         "stage":    STAGE_LABELS["mesh_generate"],
         "type":     "mesh",
-        "glb_path": glb_path,
+        "glb_path": mesh_path,
         "metrics": {
             "verts": f"{len(raw_mesh.vertices):,}",
             "faces": f"{len(raw_mesh.faces):,}",
         },
-    }, glb_path
+    }, mesh_path
 
 
 def _stage_mesh_postprocess(
@@ -499,19 +498,18 @@ def _stage_mesh_postprocess(
         log.metric("post_vertices", len(post_mesh.vertices), unit="verts")
         log.metric("post_faces",    len(post_mesh.faces),    unit="faces")
 
-    glb_path = save_dir / "mesh_postprocessed.glb"
-    post_mesh.export(str(glb_path))
+    mesh_path = state["mesh_saver"].save(post_mesh, save_dir, "mesh_postprocessed")
     state["post_mesh"] = post_mesh
 
     return {
         "stage":    STAGE_LABELS["mesh_postprocess"],
         "type":     "mesh",
-        "glb_path": glb_path,
+        "glb_path": mesh_path,
         "metrics": {
             "verts": f"{len(post_mesh.vertices):,}",
             "faces": f"{len(post_mesh.faces):,}",
         },
-    }, glb_path
+    }, mesh_path
 
 
 def _stage_render_multiview(
@@ -529,7 +527,7 @@ def _stage_render_multiview(
         uv_mesh = uv_unwrap_mesh(state["post_mesh"])
         log.metric("uv_verts", len(uv_mesh.vertices), unit="verts")
 
-    uv_mesh.export(str(save_dir / "mesh_uv.glb"))
+    uv_path = state["mesh_saver"].save(uv_mesh, save_dir, "mesh_uv")
 
     with log.step("PaintPipeline init"):
         paint_pipeline = PaintPipeline(cfg)
@@ -558,14 +556,12 @@ def _stage_render_multiview(
     while len(view_b64s) < n_cols:
         view_b64s.append(None)
 
-    uv_glb_path = save_dir / "mesh_uv.glb"
-
     return {
         "stage":   STAGE_LABELS["render_multiview"],
         "type":    "images",
         "views":   view_b64s,
         "metrics": {"normal_maps": str(len(normal_maps))},
-    }, uv_glb_path
+    }, uv_path
 
 
 def _stage_paint_multiview(
@@ -862,11 +858,13 @@ def run_pipeline(
     yield build_table_html(rows, n_views), latest_mesh
 
     # ---- Pipeline state accumulated across stages ---------------------------
+    from src.mesh_io import MeshSaver
     state: dict = {
         "view_paths":              view_paths,
         "mode":                    mode,
         "n_views":                 n_views,
         "output_format":           output_format,
+        "mesh_saver":              MeshSaver(output_format),
         "remove_bg":               remove_bg,
         "center_subject":          center_subject,
         "preprocess_target_size":  preprocess_target_size,

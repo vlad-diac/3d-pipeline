@@ -91,12 +91,25 @@ def inpaint_textures(
         "Inpainting textures — vertex_inpaint=%s  method=%s.", vertex_inpaint, method
     )
 
+    # ViewProcessor.texture_inpaint(texture, mask, defualt=None) — the upstream
+    # API does not expose a vertex-aware pass or method selector at this level.
+    # vertex_inpaint and method are accepted in our signature for compatibility
+    # but have no effect; uv_inpaint (OpenCV) runs unconditionally via the
+    # defualt=None path inside texture_inpaint.
+    if vertex_inpaint or method != "NS":
+        logger.warning(
+            "vertex_inpaint=%s and method=%r were requested but the upstream "
+            "ViewProcessor.texture_inpaint API does not expose these controls. "
+            "Using the default uv_inpaint (OpenCV) pass only.",
+            vertex_inpaint, method,
+        )
+
     with torch.inference_mode():
         refined_albedo = pipeline.view_processor.texture_inpaint(
-            texture_albedo, mask_albedo_u8, vertex_inpaint, method
+            texture_albedo, mask_albedo_u8
         )
         refined_mr = pipeline.view_processor.texture_inpaint(
-            texture_mr, mask_mr_u8, vertex_inpaint, method
+            texture_mr, mask_mr_u8
         )
 
     logger.info("Inpainting complete.")
