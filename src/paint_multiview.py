@@ -126,7 +126,11 @@ class MultiviewDiffusionNet:
         self.device = cfg.device
 
         # ---- validate model directory ----------------------------------------
-        model_dir = cfg.models_dir / "hunyuan3d-paintpbr-v2-1"
+        # snapshot_download preserves the HF subfolder prefix in local_dir, so the
+        # weights land at  models/hunyuan3d-paintpbr-v2-1/hunyuan3d-paintpbr-v2-1/
+        # (same double-nesting pattern as load_shape_pipeline_local in mesh_generate.py).
+        _model_suffix = "hunyuan3d-paintpbr-v2-1"
+        model_dir = cfg.models_dir / _model_suffix / _model_suffix
         if not model_dir.exists():
             raise FileNotFoundError(
                 f"Paint model not found: {model_dir}\n"
