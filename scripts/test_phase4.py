@@ -71,22 +71,49 @@ def load_postprocessed_mesh(args, cfg) -> trimesh.Trimesh:
         log.metric("mesh_source", str(args.glb))
         return loaded
 
-    from src.preprocess import load_image_rgba, compose_over_white
+    from src.preprocess import (
+        load_image_rgba, compose_over_white,
+        scan_multiview_folder, collect_views, preprocess_all_views,
+    )
     from src.mesh_generate import load_shape_pipeline_auto, generate_mesh
     from src.mesh_postprocess import postprocess_mesh, save_mesh
 
-    print(f"\n[mesh] Generating from {args.image}")
+    # ---- Build shape_views dict --------------------------------------------
+    if args.multiview:
+        print(f"\n[mesh] Generating from multiview folder: {args.multiview}")
 
-    with log.step("load_image + white composite"):
-        raw_img = load_image_rgba(args.image)
-        shape_img = compose_over_white(raw_img)
-        log.metric("input_image", f"{args.image.name} {raw_img.size[0]}×{raw_img.size[1]}", unit="px")
+        with log.step("scan_multiview_folder"):
+            view_paths = scan_multiview_folder(args.multiview)
+            for orient, p in view_paths.items():
+                log.metric(f"input_{orient}", p.name)
 
+        with log.step("load + preprocess all views"):
+            raw_views = collect_views(**{k: str(v) for k, v in view_paths.items()})
+            processed = preprocess_all_views(raw_views, remove_bg=False)
+            shape_views = {k: v["shape"] for k, v in processed.items()}
+
+        cfg.use_multiview_shape = True
+        mode_label = f"multiview ({len(shape_views)} views)"
+
+    else:
+        print(f"\n[mesh] Generating from {args.image}")
+
+        with log.step("load_image + white composite"):
+            raw_img = load_image_rgba(args.image)
+            shape_views = {"front": compose_over_white(raw_img)}
+            log.metric("input_image", f"{args.image.name} {raw_img.size[0]}×{raw_img.size[1]}", unit="px")
+
+        cfg.use_multiview_shape = False
+        mode_label = "single-image"
+
+    log.metric("generation_mode", mode_label)
+
+    # ---- Load pipeline + generate ------------------------------------------
     with log.step("load_shape_pipeline_auto"):
         pipeline = load_shape_pipeline_auto(cfg)
 
-    with log.step(f"generate_mesh (steps={cfg.shape_steps})"):
-        raw_mesh = generate_mesh(pipeline, {"front": shape_img}, cfg)
+    with log.step(f"generate_mesh ({mode_label}, steps={cfg.shape_steps})"):
+        raw_mesh = generate_mesh(pipeline, shape_views, cfg)
         log.metric("raw_vertices", len(raw_mesh.vertices), unit="verts")
         log.metric("raw_faces",    len(raw_mesh.faces),    unit="faces")
 
@@ -148,7 +175,7 @@ def run_render(args, cfg) -> tuple:
 def run_paint(args, cfg, uv_mesh, paint_pipeline, normal_maps, position_maps) -> None:
     import torch
     from src.paint_multiview import MultiviewDiffusionNet, delight_reference, upscale_views
-    from src.preprocess import load_image_rgba
+    from src.preprocess import load_image_rgba, scan_multiview_folder
 
     paint_model_dir = cfg.models_dir / "hunyuan3d-paintpbr-v2-1"
     if not paint_model_dir.exists():
@@ -158,10 +185,21 @@ def run_paint(args, cfg, uv_mesh, paint_pipeline, normal_maps, position_maps) ->
         )
         return
 
+    # Resolve the front-view reference image path.
+    # For multiview, use the -front image from the scanned folder.
+    if args.image:
+        front_path = args.image
+    elif args.multiview:
+        view_paths = scan_multiview_folder(args.multiview)
+        front_path = view_paths["front"]
+    else:
+        print("\n[paint] SKIPPED — no reference image available.")
+        return
+
     print("\n[paint] Delight + diffusion + upscale")
 
     with log.step("delight_reference"):
-        front_rgba = load_image_rgba(args.image)
+        front_rgba = load_image_rgba(front_path)
         reference = delight_reference(front_rgba, cfg)
         reference.save(str(OUTPUT_DIR / "reference_delighted.png"))
 
@@ -198,14 +236,39 @@ def run_paint(args, cfg, uv_mesh, paint_pipeline, normal_maps, position_maps) ->
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 4 test: render_multiview + paint_multiview")
+    parser = argparse.ArgumentParser(
+        description="Phase 4 test: render_multiview + paint_multiview",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # single image → mesh generation + render + paint
+  python scripts/test_phase4.py --image inputs/object.png
+
+  # four-view folder → multiview mesh generation + render + paint
+  python scripts/test_phase4.py --multiview inputs/object/
+
+  # skip mesh generation, use existing GLB
+  python scripts/test_phase4.py --glb outputs/test/phase3/.../mesh_postprocessed.glb
+        """,
+    )
     src_group = parser.add_mutually_exclusive_group(required=True)
-    src_group.add_argument("--image", type=Path, default=None,
-                           help="Input image — mesh is generated via Phase 3 pipeline.")
-    src_group.add_argument("--glb", type=Path, default=None,
-                           help="Pre-generated postprocessed GLB (skips mesh generation).")
+    src_group.add_argument(
+        "--image", type=Path, default=None,
+        help="Single front-view image → Path A (v2.1 DiT) mesh generation.",
+    )
+    src_group.add_argument(
+        "--multiview", type=Path, default=None, metavar="DIR",
+        help=(
+            "Folder with 4 orientation-suffixed images → Path B (2mv DiT). "
+            "Expected: *-front.<ext>  *-left.<ext>  *-right.<ext>  *-back.<ext>"
+        ),
+    )
+    src_group.add_argument(
+        "--glb", type=Path, default=None,
+        help="Pre-generated postprocessed GLB — skips mesh generation entirely.",
+    )
     parser.add_argument("--shape-steps", type=int, default=50,
-                        help="Shape diffusion steps when using --image (default 50).")
+                        help="Shape diffusion steps when generating mesh (default 50).")
     parser.add_argument("--paint-steps", type=int, default=10,
                         help="Paint diffusion steps (default 10).")
     parser.add_argument("--skip-paint", action="store_true",
@@ -214,9 +277,9 @@ def main() -> None:
                         help="Random seed (logged for reproducibility).")
     args = parser.parse_args()
 
-    # --image is required for run_paint; validate early
-    if not args.skip_paint and args.glb and args.image is None:
-        print("NOTE: --image not given with --glb — paint stage will be skipped (no reference image).")
+    # Paint needs a front reference image; auto-skip only when using --glb without --image.
+    if not args.skip_paint and args.glb and args.image is None and args.multiview is None:
+        print("NOTE: --glb used without --image or --multiview — paint stage will be skipped.")
         args.skip_paint = True
 
     seed = resolve_seed(args.seed)
