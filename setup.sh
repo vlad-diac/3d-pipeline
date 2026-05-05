@@ -109,7 +109,7 @@ if run_from 0; then
 
     # What's already present
     REPOS_CLONED=0
-    [[ -d "${THIRD_PARTY_DIR}/Hunyuan3D-2.1/.git" && -d "${THIRD_PARTY_DIR}/Hunyuan3D-2/.git" ]] && REPOS_CLONED=1
+    [[ -d "${THIRD_PARTY_DIR}/Hunyuan3D-2.1/.git" && -d "${THIRD_PARTY_DIR}/Hunyuan3D-2/.git" && -d "${THIRD_PARTY_DIR}/MV-Adapter/.git" ]] && REPOS_CLONED=1
     MODELS_PRESENT=0
     [[ -d "${MODELS_DIR}/hunyuan3d-dit-v2-1" && -d "${MODELS_DIR}/hunyuan3d-paintpbr-v2-1" ]] && MODELS_PRESENT=1
     ENV_EXISTS=0
@@ -128,7 +128,7 @@ if run_from 0; then
     printf "  %-42s %s\n" "Step 3: Create conda env"       "$( [[ ${ENV_EXISTS} -eq 1 ]] && echo "SKIP (${ENV_NAME} exists)" || echo "WILL CREATE ${ENV_NAME}" )"
     printf "  %-42s %s\n" "Step 4: Install PyTorch"        "$( [[ "${OS}" == "Darwin" ]] && echo 'CPU-only (macOS)' || echo 'CUDA 12.4' )"
     printf "  %-42s %s\n" "Step 5: Python dependencies"    "from requirements.txt"
-    printf "  %-42s %s\n" "Step 6: Clone repos"            "$( [[ ${REPOS_CLONED} -eq 1 ]] && echo 'SKIP (already cloned)' || echo 'WILL CLONE 3 repos' )"
+    printf "  %-42s %s\n" "Step 6: Clone repos"            "$( [[ ${REPOS_CLONED} -eq 1 ]] && echo 'SKIP (already cloned)' || echo 'WILL CLONE 4 repos + install MV-Adapter' )"
     printf "  %-42s %s\n" "Step 7: Build CUDA extensions"  "$( [[ "${OS}" == "Darwin" ]] && echo 'SKIP (macOS — no CUDA)' || ( command -v nvcc &>/dev/null && echo 'WILL BUILD' || echo 'SKIP (nvcc not found)' ) )"
     printf "  %-42s %s\n" "Step 8: Download model weights" "$( [[ ${MODELS_PRESENT} -eq 1 ]] && echo 'SKIP (already present)' || echo 'WILL DOWNLOAD ~27 GB' )"
     printf "  %-42s %s\n" "Step 9: Verification"           "WILL RUN"
@@ -273,6 +273,31 @@ if run_from 6; then
         "https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git" \
         "${THIRD_PARTY_DIR}/ComfyUI-Hunyuan3d-2-1" \
         "ComfyUI-Hunyuan3d-2-1 (reference)"
+
+    # MV-Adapter — canonical multiview generation stage
+    clone_or_skip \
+        "https://github.com/huanngzh/MV-Adapter.git" \
+        "${THIRD_PARTY_DIR}/MV-Adapter" \
+        "MV-Adapter (canonical_multiview stage)"
+
+    # Install MV-Adapter as an editable Python package so `import mvadapter` works.
+    # Its requirements.txt pulls in diffusers/transformers/accelerate (already present
+    # from requirements.txt) so this is mostly a no-op on top of the existing env.
+    MV_ADAPTER_DIR="${THIRD_PARTY_DIR}/MV-Adapter"
+    if [[ -d "${MV_ADAPTER_DIR}" ]]; then
+        if python -c "import mvadapter" 2>/dev/null; then
+            success "mvadapter already importable — skipping install"
+        else
+            info "Installing MV-Adapter Python package..."
+            if [[ -f "${MV_ADAPTER_DIR}/requirements.txt" ]]; then
+                pip install -r "${MV_ADAPTER_DIR}/requirements.txt" --quiet
+            fi
+            pip install -e "${MV_ADAPTER_DIR}" --quiet
+            success "mvadapter installed"
+        fi
+    else
+        warn "MV-Adapter directory not found — canonical_multiview stage will be unavailable"
+    fi
 fi
 
 # ─── Step 7: Build CUDA extensions ────────────────────────────────────────────
@@ -353,6 +378,14 @@ if run_from 9; then
         fi
     done
 
+    # mvadapter — required for the optional canonical_multiview stage
+    if python -c "import mvadapter" 2>/dev/null; then
+        success "mvadapter importable (canonical_multiview stage ready)"
+    else
+        warn "mvadapter not importable — canonical_multiview stage will fail at runtime"
+        warn "Fix: pip install -e third_party/MV-Adapter  (or re-run Step 6)"
+    fi
+
     if [[ "$(uname -s)" == "Linux" ]]; then
         if python -c "import custom_rasterizer_kernel" 2>/dev/null; then
             success "custom_rasterizer_kernel compiled"
@@ -361,11 +394,15 @@ if run_from 9; then
         fi
     fi
 
-    for repo in Hunyuan3D-2.1 Hunyuan3D-2; do
+    for repo in Hunyuan3D-2.1 Hunyuan3D-2 MV-Adapter; do
         if [[ -d "${THIRD_PARTY_DIR}/${repo}/.git" ]]; then
             success "third_party/${repo} cloned"
         else
-            warn "third_party/${repo} not found (run Step 6)"
+            if [[ "${repo}" == "MV-Adapter" ]]; then
+                warn "third_party/${repo} not found — run Step 6 to clone"
+            else
+                warn "third_party/${repo} not found (run Step 6)"
+            fi
         fi
     done
 
@@ -389,3 +426,6 @@ success "setup.sh complete."
 if [[ "$(uname -s)" == "Darwin" ]]; then
     echo -e "${YELLOW}Note: GPU-only stages require RunPod or a Linux GPU machine.${RESET}"
 fi
+echo -e "${CYAN}Note: The canonical_multiview stage uses SDXL + MV-Adapter. Its model weights"
+echo -e "      (~15 GB) are NOT downloaded by default. To download them run:${RESET}"
+echo -e "  python scripts/download_models.py --models mv_adapter sdxl_base sdxl_vae dpt_midas"
